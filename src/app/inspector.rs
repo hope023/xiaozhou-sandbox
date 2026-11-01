@@ -70,7 +70,12 @@ impl App {
                                 .desired_width(260.0)
                                 .font(egui::TextStyle::Name("H2".into())),
                         );
-                        resp.request_focus();
+                        // 只抢一次焦点：每帧抢会顺带 interrupt_ime()，
+                        // 输入法组合被逐帧打断，中文（拼音）根本拼不完。
+                        if self.rename_focus_pending {
+                            resp.request_focus();
+                            self.rename_focus_pending = false;
+                        }
                         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             self.commit_rename(&e.id);
                         }
@@ -108,8 +113,7 @@ impl App {
                                     Some(widgets::Confirm::delete_folder(e.id.clone(), &e.name));
                             }
                             if widgets::icon_button(ui, Icon::Edit, "重命名").clicked() {
-                                self.renaming = true;
-                                self.rename_draft = e.name.clone();
+                                self.begin_rename(&e.name);
                             }
                             return;
                         }
@@ -117,8 +121,7 @@ impl App {
                             self.confirm = Some(widgets::Confirm::delete_entry(e.id.clone(), &e.name));
                         }
                         if widgets::icon_button(ui, Icon::Edit, "重命名").clicked() {
-                            self.renaming = true;
-                            self.rename_draft = e.name.clone();
+                            self.begin_rename(&e.name);
                         }
                         if widgets::icon_button(ui, Icon::Download, "解密导出到本地").clicked() {
                             self.export_selected();

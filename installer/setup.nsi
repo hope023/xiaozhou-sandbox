@@ -17,10 +17,10 @@ SetCompressor /SOLID lzma
 !define APP_NAME    "小舟沙盒"
 !define APP_DIR     "XiaozhouSandbox"
 !define APP_EXE     "xiaozhou-sandbox.exe"
-; 版本号以 Cargo.toml 为准：打包脚本用 -DAPP_VER=... 传进来，
-; 直接手跑 makensis 时退回下面这个默认值。
+; 版本号以 Cargo.toml 为准，由 scripts/package.sh 用 -DAPP_VER=... 传进来。
+; 这里故意不留默认值：写死一个数就会和 Cargo.toml 漂移，宁可编译报错。
 !ifndef APP_VER
-  !define APP_VER "0.1.0"
+  !error "缺少版本号：请用 scripts/package.sh 打包（它会读 Cargo.toml 并传 -DAPP_VER）"
 !endif
 !define APP_PUB     "小舟沙盒"
 !define APP_ID      "com.xiaozhou.sandbox"

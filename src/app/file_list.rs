@@ -75,6 +75,7 @@ impl App {
                     );
                     if widgets::icon_button(ui, Icon::Search, "全文搜索（Ctrl+K）").clicked() {
                         self.panel = Some(Panel::Search);
+                        self.search.focus_pending = true;
                         self.search.report = crate::service::search_status(&self.state);
                     }
                     if self.nav == Nav::Dir && widgets::icon_button(ui, Icon::FolderPlus, "新建文件夹").clicked() {

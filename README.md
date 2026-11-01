@@ -105,7 +105,7 @@ cargo build --release  # 产物：target/release/xiaozhou-sandbox.exe（单文�
 
 ```bash
 cargo build --release
-makensis installer/setup.nsi   # 产物：dist/小舟沙盒-0.1.0-安装包.exe
+bash scripts/package.sh        # 读 Cargo.toml 版本 → 编译 → 打包 → 打印 SHA256
 ```
 
 安装到 `%PROGRAMFILES64%\XiaozhouSandbox`（目录名用 ASCII，快捷方式和显示名仍是中文），创建桌面与开始菜单快捷方式，注册卸载项。

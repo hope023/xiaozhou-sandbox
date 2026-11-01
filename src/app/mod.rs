@@ -125,6 +125,8 @@ pub struct SearchUi {
     pub typed_at: Option<Instant>,
     pub hits: Vec<crate::search::Hit>,
     pub report: SearchReport,
+    /// 刚打开面板，下一帧把焦点交给搜索框（只抢一次，见 panels.rs）。
+    pub focus_pending: bool,
 }
 
 pub struct App {
@@ -200,6 +202,12 @@ pub struct App {
     // 检查器改名状态
     pub renaming: bool,
     pub rename_draft: String,
+    /// 刚进入改名，下一帧把焦点交给输入框（只抢一次）。
+    ///
+    /// 不能每帧都 request_focus()：它会顺带 interrupt_ime()，而
+    /// egui-winit 收到后每帧都会 set_ime_allowed(false/true) 重置输入法，
+    /// 结果是拼音永远拼不完——英文能打、中文打不进去。
+    pub rename_focus_pending: bool,
 }
 
 impl App {
@@ -243,6 +251,7 @@ impl App {
                 typed_at: None,
                 hits: Vec::new(),
                 report: SearchReport { docs: 0, truncated: false, ms: 0, built: false, built_at: 0 },
+                focus_pending: true,
             },
             privacy_on: false,
             privacy: privacy::PrivacyState::default(),
@@ -267,6 +276,7 @@ impl App {
             about_open: false,
             renaming: false,
             rename_draft: String::new(),
+            rename_focus_pending: false,
         }
     }
 
@@ -413,6 +423,14 @@ impl App {
             }
             Err(e) => self.notify(format!("导入失败：{e}")),
         }
+    }
+
+    /// 进入改名：把原名填进输入框，并标记下一帧抢一次焦点。
+    /// 焦点只能抢一次（见 `rename_focus_pending` 的注释）。
+    pub fn begin_rename(&mut self, name: &str) {
+        self.renaming = true;
+        self.rename_draft = name.to_string();
+        self.rename_focus_pending = true;
     }
 
     pub fn new_folder(&mut self) {
@@ -625,6 +643,7 @@ impl App {
         let ctrl_k = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::K));
         if ctrl_k && self.unlocked() {
             self.panel = Some(Panel::Search);
+            self.search.focus_pending = true;
             self.search.report = service::search_status(&self.state);
         }
 

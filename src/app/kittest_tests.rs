@@ -377,3 +377,57 @@ fn kittest_video_preview_renders() {
     );
 }
 
+/// 回归：改名框必须能吃中文。
+///
+/// 旧代码每帧 `request_focus()`，而它内部会 `interrupt_ime()`，
+/// egui-winit 收到后每帧 `set_ime_allowed(false/true)` 重置输入法——
+/// 表现就是英文能打、拼音永远拼不完（候选框一闪就没）。
+#[test]
+fn kittest_rename_accepts_chinese() {
+    let dir = setup_vault("renamecn");
+    let (mut harness, state) = make_app(dir);
+
+    harness.run_steps(3);
+    harness
+        .get(By::new().role(egui::accesskit::Role::PasswordInput))
+        .type_text(PW);
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(10);
+
+    let entry = service::list_dir(&state, "root")
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "hello.txt")
+        .expect("hello.txt 应该在根目录");
+    harness.state_mut().selected = Some(entry);
+    harness.run_steps(2);
+    harness.state_mut().begin_rename("hello.txt");
+    harness.run_steps(2);
+
+    assert!(
+        !harness.state().rename_focus_pending,
+        "焦点标记应该在首帧就用掉，否则会逐帧打断输入法"
+    );
+    // 真正的回归点：这一帧不该再请求打断输入法组合。
+    // 每帧 request_focus() → interrupt_ime() → egui-winit 每帧
+    // set_ime_allowed(false/true)，拼音组合被反复清掉，中文就打不进来。
+    let interrupted = harness
+        .output()
+        .platform_output
+        .ime
+        .as_ref()
+        .is_some_and(|i| i.should_interrupt_composition);
+    assert!(!interrupted, "改名框不该逐帧打断输入法组合");
+
+    // 模拟输入法上屏（等价于拼音选完候选后的 Commit）
+    harness.input_mut().events.push(egui::Event::Ime(
+        egui::ImeEvent::Commit("季度报告".into()),
+    ));
+    harness.run_steps(2);
+
+    let draft = harness.state().rename_draft.clone();
+    assert!(
+        draft.contains("季度报告"),
+        "中文应能进入改名框，实际：{draft:?}"
+    );
+}

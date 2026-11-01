@@ -458,7 +458,12 @@ impl App {
                         .hint_text("搜索文件内容与文件名，支持中文（二元组切分）")
                         .desired_width(f32::INFINITY),
                 );
-                resp.request_focus();
+                // 只抢一次焦点：每帧抢会顺带 interrupt_ime()，
+                // 中文（拼音）会因为组合被逐帧重置而打不进去。
+                if self.search.focus_pending {
+                    resp.request_focus();
+                    self.search.focus_pending = false;
+                }
 
                 // 防抖 180ms 查询
                 if resp.changed() {
