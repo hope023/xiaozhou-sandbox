@@ -148,6 +148,13 @@ impl App {
                     return;
                 };
 
+                // 保存/取消先记下来，等整页画完再执行。
+                // 这两个动作会清空 settings_draft，而下面的区块还要读它；
+                // 在这里直接执行的话，后面的 clone().unwrap() 会 panic——
+                // release 是 panic=abort，表现出来就是「点保存就闪退」。
+                let mut want_save = false;
+                let mut want_cancel = false;
+
                 // 底部操作条先占位，避免上面的滚动区把按钮挤出面板
                 egui::Panel::bottom("settings-footer")
                     .exact_size(52.0)
@@ -160,16 +167,10 @@ impl App {
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if widgets::primary_button(ui, "保存设置").clicked() {
-                                if let Some(draft) = self.settings_draft.take() {
-                                    match crate::service::update_settings(&self.state, draft) {
-                                        Ok(_) => self.notify("设置已保存"),
-                                        Err(e) => self.notify(format!("保存失败：{e}")),
-                                    }
-                                }
-                                self.close_panel();
+                                want_save = true;
                             }
                             if widgets::ghost_button(ui, "取消").clicked() {
-                                self.close_panel();
+                                want_cancel = true;
                             }
                         });
                     });
@@ -195,7 +196,7 @@ impl App {
                     setting_row_rest(ui, "反截屏", "阻止其他程序截取本窗口画面");
 
                     // 空闲自动锁定
-                    let mut d = self.settings_draft.clone().unwrap();
+                    let Some(mut d) = self.settings_draft.clone() else { return; };
                     let lock_opts: [(u32, &str); 6] = [
                         (0, "不自动锁"),
                         (1, "1 分钟"),
@@ -223,7 +224,7 @@ impl App {
                     ui.add_space(10.0);
                     section(ui, "版本历史");
 
-                    let mut d = self.settings_draft.clone().unwrap();
+                    let Some(mut d) = self.settings_draft.clone() else { return; };
                     let ret_opts: [(&str, &str); 3] = [
                         ("tiered", "近密远疏（推荐）"),
                         ("all", "全部保留"),
@@ -254,7 +255,7 @@ impl App {
                     ui.add_space(10.0);
                     section(ui, "备份");
 
-                    let mut d = self.settings_draft.clone().unwrap();
+                    let Some(mut d) = self.settings_draft.clone() else { return; };
                     if ui.checkbox(&mut d.backup.enabled, "").changed() {
                         // 启用备份是免费能力，直接生效
                     }
@@ -420,7 +421,18 @@ impl App {
                     );
                 });
 
-                // 底部操作条已在 show_inside 的 Panel::bottom 里（见 settings-footer）
+                if want_save {
+                    if let Some(draft) = self.settings_draft.take() {
+                        match crate::service::update_settings(&self.state, draft) {
+                            Ok(_) => self.notify("设置已保存"),
+                            Err(e) => self.notify(format!("保存失败：{e}")),
+                        }
+                    }
+                    self.close_panel();
+                }
+                if want_cancel {
+                    self.close_panel();
+                }
             });
     }
 

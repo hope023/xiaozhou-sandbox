@@ -206,6 +206,42 @@ fn kittest_folder_actions_visible() {
 }
 
 
+
+/// 回归：设置页点「保存设置」不能闪退。
+/// 原来保存动作在底部条里就执行，把 settings_draft 清空了，
+/// 而下面的滚动区还在 clone().unwrap() 它——release 是 panic=abort，直接进程消失。
+#[test]
+fn kittest_save_settings_does_not_crash() {
+    let dir = setup_vault("settingssave");
+    let (mut harness, state) = make_app(dir);
+
+    harness.run_steps(3);
+    harness
+        .get(By::new().role(egui::accesskit::Role::PasswordInput))
+        .type_text(PW);
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(10);
+
+    // 打开设置
+    harness.get(By::new().label("设置")).click();
+    harness.run_steps(5);
+
+    // 保存
+    harness.get(By::new().label("保存设置")).click();
+    harness.run_steps(5);
+
+    // 面板应该关掉，且库仍然可用（没崩、没被锁）
+    assert!(harness.query(By::new().label("保存设置")).is_none(), "设置面板应该已经关闭");
+    assert!(state.is_unlocked(), "保存设置不该把库锁上");
+
+    // 再打开一次 → 取消，同样不能崩
+    harness.get(By::new().label("设置")).click();
+    harness.run_steps(5);
+    harness.get(By::new().label("取消")).click();
+    harness.run_steps(5);
+    assert!(harness.query(By::new().label("保存设置")).is_none());
+}
+
 /// GIF：选中后要真的动起来（帧序号随时间推进）。
 #[test]
 fn kittest_gif_animates() {
