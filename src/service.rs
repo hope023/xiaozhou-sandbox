@@ -655,6 +655,12 @@ pub fn backup_now(state: &AppState) -> Result<BackupReport> {
     Ok(rep)
 }
 
+/// 给当前库补一个第二口令（隐藏空间）。需要主口令授权。
+pub fn add_second_password(state: &AppState, main: &str, second: &str) -> Result<()> {
+    let root = state.read(|v| Ok(v.root.clone()))?;
+    vault::add_second(&root, main, second)
+}
+
 pub fn change_password(state: &AppState, old: &str, new: &str) -> Result<()> {
     if new.chars().count() < 8 {
         return Err(Error::Msg("新密码至少 8 个字符".into()));

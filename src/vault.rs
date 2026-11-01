@@ -190,6 +190,44 @@ pub fn unlock_full(root: &Path, password: &str) -> Result<Unlocked> {
     Err(Error::BadPassword)
 }
 
+
+/// 给已有保险库补一个第二口令。
+///
+/// 第二口令封装的是**一把全新的 DEK**，所以用它打开是一个空库，
+/// 与主口令的内容完全隔离——主库看不到它，它也看不到主库。
+/// 这是「隐藏空间」，不是「第二个能进同一空间的密码」。
+pub fn add_second(root: &Path, main_password: &str, second: &str) -> Result<()> {
+    let mut vf = read_header(root)?;
+
+    // 必须能用主口令打开，才能给它加第二个入口
+    let ok = vf
+        .keyslots
+        .iter()
+        .any(|s| s.kind == "password" && try_slot(s, main_password).is_some());
+    if !ok {
+        return Err(Error::BadPassword);
+    }
+
+    let second = second.trim();
+    if second.chars().count() < 8 {
+        return Err(Error::Msg("第二口令至少 8 个字符".into()));
+    }
+    // 已经能打开本库的口令不能再加一遍，否则同一个入口出现两个 slot
+    if vf
+        .keyslots
+        .iter()
+        .any(|s| s.kind == "password" && try_slot(s, second).is_some())
+    {
+        return Err(Error::Msg("这个口令已经能打开本库了，换一个".into()));
+    }
+
+    let dek2 = crypto::random_key();
+    vf.keyslots
+        .push(make_slot(None, "password", "第二口令", second, &dek2[..])?);
+    atomic_write(&root.join("vault.json"), &serde_json::to_vec_pretty(&vf)?)?;
+    Ok(())
+}
+
 /// 改密码只需重包裹 DEK，不触碰任何文件内容。
 ///
 /// 必须按"哪个口令能打开哪个 slot"来定位：多口令的库里，

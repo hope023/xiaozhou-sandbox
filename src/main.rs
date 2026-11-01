@@ -259,6 +259,42 @@ mod tests {
         assert!(service::list_dir(&state, &folder.id).unwrap().is_empty());
     }
 
+    /// 已有库补第二口令：第二口令进的是独立空库，主库内容不受影响。
+    #[test]
+    fn add_second_password_to_existing_vault() {
+        let dir = tmp("addsecond");
+        vault::create(&dir, "main-pass-123", None).unwrap();
+        let dek = vault::unlock(&dir, "main-pass-123").unwrap();
+        let mut v = store::Vault::open(dir.clone(), dek).unwrap();
+        let src = dir.join("a.txt");
+        std::fs::write(&src, b"main only").unwrap();
+        v.import_file("root", "a.txt", &src).unwrap();
+        v.save_index().unwrap();
+
+        // 主口令不对就加不了
+        assert!(vault::add_second(&dir, "wrong-pass-123", "second-pass-1").is_err());
+        // 第二口令太短也不行
+        assert!(vault::add_second(&dir, "main-pass-123", "short").is_err());
+
+        vault::add_second(&dir, "main-pass-123", "second-pass-1").unwrap();
+
+        // 第二口令：另一个索引文件，里面是空的
+        let s = vault::unlock_full(&dir, "second-pass-1").unwrap();
+        assert_ne!(s.index_file, "index.enc");
+        let vs = store::Vault::open_named(dir.clone(), s.dek, &s.index_file).unwrap();
+        assert!(vs.index.entries.is_empty(), "第二口令不该看到主库的文件");
+
+        // 主口令不受影响
+        let m = vault::unlock_full(&dir, "main-pass-123").unwrap();
+        assert_eq!(m.index_file, "index.enc");
+        let vm = store::Vault::open_named(dir.clone(), m.dek, &m.index_file).unwrap();
+        assert_eq!(vm.index.entries.len(), 1);
+
+        // 已经能开库的口令不能重复添加
+        assert!(vault::add_second(&dir, "main-pass-123", "main-pass-123").is_err());
+        assert!(vault::add_second(&dir, "main-pass-123", "second-pass-1").is_err());
+    }
+
     #[test]
     fn vault_create_unlock_and_wrong_password() {
         let dir = tmp("vault");

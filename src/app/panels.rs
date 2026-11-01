@@ -371,6 +371,37 @@ impl App {
                     }
 
                     ui.add_space(10.0);
+                    section(ui, "第二口令（隐藏空间）");
+                    ui.label(
+                        egui::RichText::new("添加后，用第二口令打开会进入一个独立空间：看不到主库的文件，主库也看不到它的。它是另一把钥匙，不是同一个空间的第二个密码。")
+                            .size(11.5)
+                            .color(theme::MUTED),
+                    );
+                    ui.add_space(3.0);
+                    let (m_pw, s_pw, s_again) = self.settings_second.clone();
+                    ui.add(egui::TextEdit::singleline(&mut self.settings_second.0).password(true).hint_text("当前主口令").desired_width(280.0));
+                    ui.add_space(3.0);
+                    ui.add(egui::TextEdit::singleline(&mut self.settings_second.1).password(true).hint_text("新的第二口令（至少 8 个字符）").desired_width(280.0));
+                    ui.add_space(3.0);
+                    ui.add(egui::TextEdit::singleline(&mut self.settings_second.2).password(true).hint_text("再输一遍第二口令").desired_width(280.0));
+                    ui.add_space(4.0);
+                    if widgets::ghost_button(ui, "添加第二口令").clicked() {
+                        if s_pw.chars().count() < 8 {
+                            self.notify("第二口令至少 8 个字符");
+                        } else if s_pw != s_again {
+                            self.notify("两次输入的第二口令不一致");
+                        } else {
+                            match crate::service::add_second_password(&self.state, &m_pw, &s_pw) {
+                                Ok(()) => {
+                                    self.settings_second = Default::default();
+                                    self.notify("已添加第二口令：锁定后用它可以进入独立空间");
+                                }
+                                Err(e) => self.notify(format!("添加失败：{e}")),
+                            }
+                        }
+                    }
+
+                    ui.add_space(10.0);
                     section(ui, "关于");
 
                     ui.label(egui::RichText::new("小舟沙盒 v0.1.0").size(13.0).color(theme::TEXT));

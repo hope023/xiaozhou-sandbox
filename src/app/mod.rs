@@ -153,6 +153,8 @@ pub struct App {
     pub settings_draft: Option<crate::store::Settings>,
     pub settings_capture: bool,
     pub settings_pw: (String, String, String),
+    /// (主口令, 新的第二口令, 再输一遍)
+    pub settings_second: (String, String, String),
     pub versions: Vec<VersionView>,
     pub versions_for: String,
 
@@ -223,6 +225,7 @@ impl App {
             settings_draft: None,
             settings_capture: false,
             settings_pw: Default::default(),
+            settings_second: Default::default(),
             versions: Vec::new(),
             versions_for: String::new(),
             editor: None,
