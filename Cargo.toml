@@ -1,0 +1,62 @@
+[package]
+name = "xiaozhou-sandbox"
+version = "0.1.0"
+description = "小舟沙盒 - 本地加密保险库"
+edition = "2021"
+rust-version = "1.77"
+
+[dependencies]
+# UI 框架（纯 Rust 自绘，无 WebView）
+eframe = "0.37"
+# 原生文件/目录选择对话框
+rfd = "0.15"
+# 应用数据目录定位（与 Tauri 版 %APPDATA% / %LOCALAPPDATA% 布局保持兼容）
+dirs = "6"
+# 拿主窗口 HWND（反截屏 / IME 解绑）
+raw-window-handle = "0.6"
+# 视频解码：Windows 自带的 Media Foundation（系统组件，无第三方解码器、无 GPL）
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media",
+    "Win32_Media_Audio",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+] }
+# 实现 COM 接口（IStream）时 `#[implement]` 宏展开需要直接引用这个 crate
+windows-core = "0.62"
+# 图片解码（纯 Rust，支持 png/jpeg/gif/webp/bmp）
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+] }
+# ── 以下与原 src-tauri 依赖一致，核心加密库原样复用 ──
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+chrono = "0.4"
+mime_guess = "2"
+ed25519-dalek = "2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["snapshot", "eframe", "wgpu"] }

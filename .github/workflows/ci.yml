@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 编译
+        run: cargo check --all-targets
+      - name: 测试
+        # kittest 的无头窗口在同一进程里并发跑会互相踩，必须串行
+        run: cargo test -- --test-threads=1
+      - name: 依赖许可证与安全公告
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny --all-features check licenses bans sources

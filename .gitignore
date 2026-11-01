@@ -1,0 +1,21 @@
+# 构建产物
+target/
+dist/
+
+# 日志与系统文件
+*.log
+.DS_Store
+
+# 授权签发私钥与已签发的授权：绝不入库
+private-tools/
+keys/
+*.pem
+*.key
+license-secret*
+
+# 输入法词库的原始下载缓存（产物 assets/ime/*.json 要入库）
+scripts/.ime-cache/
+
+# 本地 agent 状态
+.workbuddy/
+.workbuddy-ai/
