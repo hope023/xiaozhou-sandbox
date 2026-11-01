@@ -1,7 +1,8 @@
 ﻿; 小舟沙盒 安装包（NSIS）
 ; 编译：  cargo build --release
 ;        makensis installer/setup.nsi
-; 产物：  dist/小舟沙盒-0.1.0-安装包.exe
+; 产物：  dist/小舟沙盒-<版本>-安装包.exe
+; 一条命令： scripts/package.sh（版本号自动从 Cargo.toml 读）
 ;
 ; 注意：卸载只删程序，**不删用户数据**。保险库在
 ;   %LOCALAPPDATA%\com.xiaozhou.sandbox\vault
@@ -16,7 +17,11 @@ SetCompressor /SOLID lzma
 !define APP_NAME    "小舟沙盒"
 !define APP_DIR     "XiaozhouSandbox"
 !define APP_EXE     "xiaozhou-sandbox.exe"
-!define APP_VER     "0.1.0"
+; 版本号以 Cargo.toml 为准：打包脚本用 -DAPP_VER=... 传进来，
+; 直接手跑 makensis 时退回下面这个默认值。
+!ifndef APP_VER
+  !define APP_VER "0.1.0"
+!endif
 !define APP_PUB     "小舟沙盒"
 !define APP_ID      "com.xiaozhou.sandbox"
 !define APP_DESC    "本地加密保险库"

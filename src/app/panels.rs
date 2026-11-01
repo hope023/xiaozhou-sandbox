@@ -405,7 +405,11 @@ impl App {
                     ui.add_space(10.0);
                     section(ui, "关于");
 
-                    ui.label(egui::RichText::new("小舟沙盒 v0.1.0").size(13.0).color(theme::TEXT));
+                    ui.label(
+                        egui::RichText::new(format!("小舟沙盒 v{}", env!("CARGO_PKG_VERSION")))
+                            .size(13.0)
+                            .color(theme::TEXT),
+                    );
                     ui.label(
                         egui::RichText::new("本地加密保险库：文件内容、文件名、目录结构、设置全部加密后存本地磁盘，无服务器、无账号、不联网。Argon2id 派生密钥，XChaCha20-Poly1305 加密，逐 1MB 分块防篡改。")
                             .size(11.5)

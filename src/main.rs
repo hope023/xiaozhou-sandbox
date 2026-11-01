@@ -295,6 +295,45 @@ mod tests {
         assert!(vault::add_second(&dir, "main-pass-123", "second-pass-1").is_err());
     }
 
+    /// 移动到文件夹：重名自动改名、不能移进自己或自己的子孙、能移回根目录。
+    #[test]
+    fn move_entries_between_folders() {
+        let dir = tmp("move");
+        vault::create(&dir, "pw12345678", None).unwrap();
+        let dek = vault::unlock(&dir, "pw12345678").unwrap();
+        let mut v = store::Vault::open(dir.clone(), dek).unwrap();
+
+        let a = v.create_folder("root", "A").unwrap();
+        let b = v.create_folder(&a.id, "B").unwrap();
+        let s1 = dir.join("dup.txt");
+        std::fs::write(&s1, b"root copy").unwrap();
+        let root_dup = v.import_file("root", "dup.txt", &s1).unwrap();
+        let s2 = dir.join("dup2.txt");
+        std::fs::write(&s2, b"in A").unwrap();
+        v.import_file(&a.id, "dup.txt", &s2).unwrap();
+        v.save_index().unwrap();
+
+        let state = std::sync::Arc::new(state::AppState::default());
+        service::open_vault_at(&state, &dir.display().to_string()).unwrap();
+        service::unlock(&state, "pw12345678").unwrap();
+
+        // 根目录的 dup.txt 移进 A：A 里已有同名文件，自动改成 dup (2).txt
+        let moved = service::move_entry(&state, &root_dup.id, &a.id).unwrap();
+        assert_eq!(moved.name, "dup (2).txt", "重名应该自动加序号");
+        let names: Vec<String> = service::list_dir(&state, &a.id).unwrap().iter().map(|e| e.name.clone()).collect();
+        assert!(names.contains(&"dup (2).txt".to_string()), "A 里应该有改名后的文件：{names:?}");
+        assert_eq!(service::list_dir(&state, "root").unwrap().len(), 1, "根目录只剩 A");
+
+        // 不能移进自己，也不能移进自己的子孙
+        assert!(service::move_entry(&state, &a.id, &a.id).is_err());
+        assert!(service::move_entry(&state, &a.id, &b.id).is_err());
+
+        // 移回根目录
+        let back = service::move_entry(&state, &moved.id, "root").unwrap();
+        assert_eq!(back.name, "dup (2).txt", "移回根目录时不该再改名");
+        assert_eq!(service::list_dir(&state, "root").unwrap().len(), 2);
+    }
+
     #[test]
     fn vault_create_unlock_and_wrong_password() {
         let dir = tmp("vault");

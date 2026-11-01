@@ -336,27 +336,7 @@ pub fn list_by_kind(state: &AppState, kind: &str) -> Result<Vec<EntryView>> {
 }
 
 fn unique_name(v: &Vault, parent: &str, name: &str) -> String {
-    let taken: Vec<&str> = v
-        .index
-        .entries
-        .values()
-        .filter(|e| e.parent == parent && e.deleted_at.is_none())
-        .map(|e| e.name.as_str())
-        .collect();
-    if !taken.contains(&name) {
-        return name.to_string();
-    }
-    let (stem, ext) = match name.rfind('.') {
-        Some(i) if i > 0 => (&name[..i], &name[i..]),
-        _ => (name, ""),
-    };
-    for n in 2..5000 {
-        let cand = format!("{} ({}){}", stem, n, ext);
-        if !taken.contains(&cand.as_str()) {
-            return cand;
-        }
-    }
-    format!("{}-{}", stem, now_ts())
+    v.unique_child_name(parent, name, "")
 }
 
 fn import_into(v: &mut Vault, src: &Path, parent: &str, skip: &Path, out: &mut ImportResult) {
@@ -411,6 +391,11 @@ pub fn create_folder(state: &AppState, parent: &str, name: &str) -> Result<Entry
         v.save_index()?;
         Ok(to_view(&e))
     })
+}
+
+/// 把条目移到另一个文件夹（拖拽 / 面包屑）。
+pub fn move_entry(state: &AppState, id: &str, new_parent: &str) -> Result<EntryView> {
+    state.write(|v| Ok(to_view(&v.move_entry(id, new_parent)?)))
 }
 
 pub fn rename_entry(state: &AppState, id: &str, name: &str) -> Result<EntryView> {

@@ -1,8 +1,8 @@
 1 ICON "icon.ico"
 
 1 VERSIONINFO
-FILEVERSION 0,1,0,0
-PRODUCTVERSION 0,1,0,0
+FILEVERSION __VER_TUPLE__
+PRODUCTVERSION __VER_TUPLE__
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -12,12 +12,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "小舟沙盒"
       VALUE "FileDescription", "小舟沙盒 - 本地加密保险库"
-      VALUE "FileVersion", "0.1.0"
+      VALUE "FileVersion", "__VER__"
       VALUE "InternalName", "xiaozhou-sandbox"
       VALUE "LegalCopyright", "MIT License"
       VALUE "OriginalFilename", "xiaozhou-sandbox.exe"
       VALUE "ProductName", "小舟沙盒"
-      VALUE "ProductVersion", "0.1.0"
+      VALUE "ProductVersion", "__VER__"
     END
   END
   BLOCK "VarFileInfo"

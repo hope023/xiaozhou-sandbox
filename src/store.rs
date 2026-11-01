@@ -344,6 +344,74 @@ impl Vault {
         v
     }
 
+
+    /// 同名冲突时生成 "名字 (2).ext"。`except_id` 用来排除自己
+    /// （在同一个文件夹里移动时，自己的名字不该被算作占用）。
+    pub fn unique_child_name(&self, parent: &str, name: &str, except_id: &str) -> String {
+        let taken: Vec<&str> = self
+            .index
+            .entries
+            .values()
+            .filter(|e| e.parent == parent && e.deleted_at.is_none() && e.id != except_id)
+            .map(|e| e.name.as_str())
+            .collect();
+        if !taken.contains(&name) {
+            return name.to_string();
+        }
+        let (stem, ext) = match name.rfind('.') {
+            Some(i) if i > 0 => (&name[..i], &name[i..]),
+            _ => (name, ""),
+        };
+        for n in 2..5000 {
+            let cand = format!("{} ({}){}", stem, n, ext);
+            if !taken.contains(&cand.as_str()) {
+                return cand;
+            }
+        }
+        format!("{}-{}", stem, now_ts())
+    }
+
+    /// 把条目移到另一个文件夹。文件夹不能移进自己或自己的子孙里。
+    pub fn move_entry(&mut self, id: &str, new_parent: &str) -> Result<Entry> {
+        if id == new_parent {
+            return Err(Error::Msg("不能移动到它自己里面".into()));
+        }
+        // "root" 是虚拟根目录，没有对应条目
+        if new_parent != "root" {
+            let target = self
+                .index
+                .entries
+                .get(new_parent)
+                .ok_or(Error::NotFound)?
+                .clone();
+            if target.kind != "dir" || target.deleted_at.is_some() {
+                return Err(Error::Msg("目标不是可用的文件夹".into()));
+            }
+        }
+
+        // 沿新父目录往上走，撞到自己就说明要移进自己的子孙里
+        let mut cur = new_parent.to_string();
+        while cur != "root" {
+            if cur == id {
+                return Err(Error::Msg("不能把文件夹移动到它自己的子目录里".into()));
+            }
+            match self.index.entries.get(&cur) {
+                Some(e) => cur = e.parent.clone(),
+                None => break,
+            }
+        }
+
+        let name = self.index.entries.get(id).ok_or(Error::NotFound)?.name.clone();
+        let unique = self.unique_child_name(new_parent, &name, id);
+        let e = self.index.entries.get_mut(id).ok_or(Error::NotFound)?;
+        e.parent = new_parent.to_string();
+        e.name = unique;
+        e.modified_at = now_ts();
+        let out = e.clone();
+        self.save_index()?;
+        Ok(out)
+    }
+
     pub fn delete_entry(&mut self, id: &str) -> Result<()> {
         let ts = now_ts();
         let ids = self.subtree_ids(id);

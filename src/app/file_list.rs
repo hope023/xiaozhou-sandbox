@@ -8,6 +8,12 @@ use super::widgets::{self, Icon};
 
 const ROW_H: f32 = 46.0;
 
+/// 拖拽时携带的东西：把某一项拖到文件夹 / 面包屑上就是移动。
+pub struct DragItem {
+    pub id: String,
+    pub name: String,
+}
+
 impl App {
     pub fn show_file_list(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("filelist")
@@ -18,15 +24,17 @@ impl App {
                 // ── 头部：面包屑或标题 ──
                 ui.horizontal(|ui| {
                     if self.nav == Nav::Dir {
-                        if ui
-                            .add(
-                                egui::Button::new("全部文件")
-                                    .fill(egui::Color32::TRANSPARENT)
-                                    .stroke(Stroke::NONE),
-                            )
-                            .clicked()
-                        {
+                        let all = ui.add(
+                            egui::Button::new("全部文件")
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE),
+                        );
+                        if all.clicked() {
                             self.goto_trail(0);
+                        }
+                        // 拖到「全部文件」= 移回根目录
+                        if let Some(p) = all.dnd_release_payload::<DragItem>() {
+                            self.move_entry_to(&p.id, &p.name, "root", "全部文件");
                         }
                         for (i, c) in self.trail.clone().iter().enumerate() {
                             ui.label(egui::RichText::new("›").size(12.0).color(theme::FAINT));
@@ -36,8 +44,14 @@ impl App {
                             ))
                             .fill(egui::Color32::TRANSPARENT)
                             .stroke(Stroke::NONE);
-                            if ui.add(btn).clicked() {
+                            let r = ui.add(btn);
+                            if r.clicked() {
                                 self.goto_crumb(i);
+                            }
+                            // 拖到面包屑 = 移到该层
+                            if let Some(p) = r.dnd_release_payload::<DragItem>() {
+                                let (tid, tname) = (c.id.clone(), c.name.clone());
+                                self.move_entry_to(&p.id, &p.name, &tid, &tname);
                             }
                         }
                     } else {
@@ -114,7 +128,11 @@ impl App {
     fn file_row(&mut self, ui: &mut egui::Ui, e: &crate::service::EntryView) {
         let selected = self.selected.as_ref().is_some_and(|s| s.id == e.id);
         let width = ui.available_width();
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H), egui::Sense::click());
+        let (rect, resp) =
+            ui.allocate_exact_size(Vec2::new(width, ROW_H), egui::Sense::click_and_drag());
+
+        // 拖起这一行：payload 由 egui 托管，松手时落到哪个文件夹就移到哪
+        resp.dnd_set_drag_payload(DragItem { id: e.id.clone(), name: e.name.clone() });
 
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::ListItem, true, &e.name));
 
@@ -176,6 +194,27 @@ impl App {
                 FontId::proportional(10.5),
                 theme::FAINT,
             );
+        }
+
+        // 文件夹作为落点：拖动中高亮，松手就移动
+        if e.kind == "dir" && self.nav == Nav::Dir {
+            let dragging = resp
+                .dnd_hover_payload::<DragItem>()
+                .is_some_and(|p| p.id != e.id);
+            if dragging {
+                ui.painter().rect_stroke(
+                    rect,
+                    CornerRadius::same(8),
+                    Stroke::new(1.5, theme::ACCENT),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if let Some(p) = resp.dnd_release_payload::<DragItem>() {
+                if p.id != e.id {
+                    let (tid, tname) = (e.id.clone(), e.name.clone());
+                    self.move_entry_to(&p.id, &p.name, &tid, &tname);
+                }
+            }
         }
 
         if resp.clicked() {

@@ -426,6 +426,20 @@ impl App {
         }
     }
 
+    /// 把条目移动到目标文件夹（拖拽落点 / 面包屑）。
+    pub fn move_entry_to(&mut self, id: &str, item_name: &str, new_parent: &str, target_name: &str) {
+        match service::move_entry(&self.state, id, new_parent) {
+            Ok(v) => {
+                self.notify(format!("已把「{item_name}」移动到「{target_name}」"));
+                if self.selected.as_ref().is_some_and(|s| s.id == v.id) {
+                    self.selected = Some(v);
+                }
+                self.need_list = true;
+            }
+            Err(e) => self.notify(format!("移动失败：{e}")),
+        }
+    }
+
     pub fn delete_selected(&mut self, id: &str) {
         match service::delete_entry(&self.state, id) {
             Ok(()) => {
