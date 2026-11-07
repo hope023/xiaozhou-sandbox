@@ -216,6 +216,50 @@ mod tests {
         assert_eq!(src.read_at(u64::MAX / 2, &mut tail).unwrap(), 0);
     }
 
+    /// 清空回收站：一次销毁所有被删条目，回收站与「全部文件」都不该留下残余。
+    #[test]
+    fn purge_trash_clears_all() {
+        let dir = tmp("purge-all");
+        vault::create(&dir, "pw12345678", None).unwrap();
+        let dek = vault::unlock(&dir, "pw12345678").unwrap();
+        let mut v = store::Vault::open(dir.clone(), dek).unwrap();
+
+        let folder = v.create_folder("root", "文档").unwrap();
+        let src = dir.join("b.txt");
+        std::fs::write(&src, b"bye").unwrap();
+        let child = v.import_file(&folder.id, "b.txt", &src).unwrap();
+        let lone = v.create_folder("root", "单独").unwrap();
+        v.save_index().unwrap();
+
+        let state = std::sync::Arc::new(state::AppState::default());
+        service::open_vault_at(&state, &dir.display().to_string()).unwrap();
+        service::unlock(&state, "pw12345678").unwrap();
+
+        // 空回收站时返回 0，而不是报错
+        assert_eq!(service::purge_trash(&state).unwrap(), 0);
+
+        service::delete_entry(&state, &folder.id).unwrap();
+        service::delete_entry(&state, &lone.id).unwrap();
+        assert_eq!(service::list_trash(&state).unwrap().len(), 3);
+
+        assert_eq!(service::purge_trash(&state).unwrap(), 3, "三项都该被销毁");
+        assert!(service::list_trash(&state).unwrap().is_empty());
+        assert!(service::list_dir(&state, "root").unwrap().is_empty());
+
+        // blob 也要跟着删掉，不能只删索引（blob 按 id 前两位分片，得递归数）
+        fn count_files(p: &std::path::Path) -> usize {
+            std::fs::read_dir(p)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| if e.path().is_dir() { count_files(&e.path()) } else { 1 })
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+        assert_eq!(count_files(&dir.join("blobs")), 0, "彻底删除后不应残留 blob");
+        assert!(child.id != lone.id);
+    }
+
     /// 文件夹：改名、删除（连同内部内容）、恢复、彻底删除。
     #[test]
     fn folder_rename_delete_and_restore() {

@@ -38,6 +38,7 @@ pub enum Nav {
     Dir,
     Image,
     Video,
+    Audio,
     Text,
     Trash,
 }
@@ -48,6 +49,7 @@ impl Nav {
             Nav::Dir => "全部文件",
             Nav::Image => "图片",
             Nav::Video => "视频",
+            Nav::Audio => "音频",
             Nav::Text => "文档",
             Nav::Trash => "回收站",
         }
@@ -56,6 +58,7 @@ impl Nav {
         match self {
             Nav::Image => "image",
             Nav::Video => "video",
+            Nav::Audio => "audio",
             Nav::Text => "text",
             _ => "",
         }
@@ -139,6 +142,8 @@ impl Default for ImageState {
 /// 切回来接着看，不用重新解密；切走时视频暂停，不会在后台继续出声。
 pub struct Tab {
     pub entry: EntryView,
+    /// 锁定的页签在打开新文件时不会被顶掉；没锁的是「临时页签」。
+    pub pinned: bool,
     pub editor: Option<EditorState>,
     pub image: ImageState,
     pub video: VideoState,
@@ -356,15 +361,53 @@ impl App {
             return;
         }
         self.park_active();
-        self.tabs.push(Tab {
+        let tab = Tab {
             entry: e,
+            pinned: false,
             editor: None,
             image: ImageState::default(),
             video: VideoState::default(),
             dup: DupState::default(),
-        });
-        self.active = self.tabs.len() - 1;
+        };
+        // 没锁定的页签是「临时页签」：打开新文件时复用它，锁定的页签一律保留。
+        // 优先顶掉正在看的那个临时页签，其次是左边第一个。
+        let slot = if self.tabs.get(self.active).is_some_and(|t| !t.pinned) {
+            Some(self.active)
+        } else {
+            self.tabs.iter().position(|t| !t.pinned)
+        };
+        match slot {
+            Some(i) => {
+                self.tabs[i] = tab;
+                self.active = i;
+            }
+            None => {
+                self.tabs.push(tab);
+                self.active = self.tabs.len() - 1;
+            }
+        }
         self.load_active();
+    }
+
+    /// 锁定/解锁页签，并把它移到对应分组：锁定的排到左边，
+    /// 解锁的回到锁定块之后。打开新文件时只有没锁的会被顶掉。
+    pub fn toggle_pin(&mut self, idx: usize) {
+        let Some(tab) = self.tabs.get(idx) else { return };
+        let pinned = !tab.pinned;
+        let active_id = self.tabs.get(self.active).map(|t| t.entry.id.clone());
+
+        let mut tab = self.tabs.remove(idx);
+        tab.pinned = pinned;
+        // 锁定块始终在最左边，插到它后面
+        let at = self.tabs.iter().take_while(|t| t.pinned).count();
+        self.tabs.insert(at, tab);
+
+        // 重排后把激活下标指回同一个页签
+        if let Some(aid) = active_id {
+            if let Some(i) = self.tabs.iter().position(|t| t.entry.id == aid) {
+                self.active = i;
+            }
+        }
     }
 
     /// 把当前页签的实时状态存回 `tabs[active]`。
@@ -745,6 +788,32 @@ impl App {
         }
     }
 
+    /// 清空回收站：整批销毁，比逐个彻底删除少点一次确认。
+    pub fn purge_trash(&mut self) {
+        let trashed: Vec<String> = service::list_trash(&self.state)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        match service::purge_trash(&self.state) {
+            Ok(0) => self.notify("回收站已经是空的"),
+            Ok(n) => {
+                // 被销毁的条目若还开着页签，页签会指向不存在的数据，得一起关掉
+                for id in &trashed {
+                    self.close_tab_by_id(id);
+                }
+                if self.selected.as_ref().is_some_and(|s| trashed.contains(&s.id)) {
+                    self.selected = None;
+                }
+                self.notify(format!("已清空回收站（{n} 项）"));
+                self.need_list = true;
+                self.need_status = true;
+                self.invalidate_duplicates();
+            }
+            Err(e) => self.notify(format!("清空失败：{e}")),
+        }
+    }
+
     pub fn restore_selected(&mut self, id: &str) {
         match service::restore_entry(&self.state, id) {
             Ok(()) => {
@@ -977,6 +1046,7 @@ impl App {
             match action {
                 ConfirmAction::DeleteEntry(id) => self.delete_selected(&id),
                 ConfirmAction::PurgeEntry(id) => self.purge_selected(&id),
+                ConfirmAction::PurgeTrash => self.purge_trash(),
             }
         }
     }

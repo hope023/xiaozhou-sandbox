@@ -61,6 +61,21 @@ impl App {
                                 .size(11.5)
                                 .color(theme::FAINT),
                         );
+                        // 回收站非空时给一个整批销毁的入口；图标按钮说不清「清空」这件事
+                        if self.nav == Nav::Trash && !self.entries.is_empty() {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let btn = egui::Button::new(
+                                    egui::RichText::new("清空回收站").size(12.0).color(theme::DANGER),
+                                )
+                                .fill(theme::PANEL)
+                                .stroke(Stroke::new(1.0, theme::DANGER))
+                                .corner_radius(CornerRadius::same(6));
+                                if ui.add(btn).clicked() {
+                                    let n = self.entries.len();
+                                    self.confirm = Some(widgets::Confirm::purge_trash(n));
+                                }
+                            });
+                        }
                     }
                 });
 

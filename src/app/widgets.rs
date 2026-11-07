@@ -96,10 +96,12 @@ impl Toast {
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(egui::Margin::symmetric(14, 9))
                     .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(&t.text)
-                                .size(13.0)
-                                .color(theme::WHITE),
+                        // Area 的可宽高很小，不显式禁止换行的话长文案会一字一行
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&t.text).size(13.0).color(theme::WHITE),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Extend),
                         );
                     });
             });
@@ -111,6 +113,7 @@ impl Toast {
 pub enum ConfirmAction {
     DeleteEntry(String), // 软删除 → 回收站
     PurgeEntry(String),  // 彻底删除
+    PurgeTrash,          // 清空回收站
 }
 
 pub struct Confirm {
@@ -149,6 +152,16 @@ impl Confirm {
         }
     }
 
+    /// 清空整个回收站：条目多的时候逐个确认太烦，但破坏性最大，文案要写死。
+    pub fn purge_trash(count: usize) -> Self {
+        Self {
+            title: "清空回收站".into(),
+            body: format!("回收站里的 {count} 项及其全部历史版本将被永久销毁，无法恢复。确定吗？"),
+            danger: true,
+            action: ConfirmAction::PurgeTrash,
+        }
+    }
+
     /// 半透明遮罩 + 居中卡片，与原 confirm 弹窗一致。
     pub fn show(ctx: &egui::Context, confirm: &mut Option<Confirm>) -> Option<ConfirmAction> {
         let Some(c) = confirm else { return None };
@@ -184,15 +197,20 @@ impl Confirm {
                             if ui.add(cancel).clicked() {
                                 close = true;
                             }
+                            let label = match (&c.action, c.danger) {
+                                (ConfirmAction::PurgeTrash, _) => "清空",
+                                (_, true) => "彻底删除",
+                                (_, false) => "确定",
+                            };
                             let btn = egui::Button::new(
-                                egui::RichText::new(if c.danger { "彻底删除" } else { "确定" })
-                                    .color(theme::WHITE),
+                                egui::RichText::new(label).color(theme::WHITE),
                             )
                             .fill(if c.danger { theme::DANGER } else { theme::ACCENT });
                             if ui.add(btn).clicked() {
                                 fired = Some(match &c.action {
                                     ConfirmAction::DeleteEntry(id) => ConfirmAction::DeleteEntry(id.clone()),
                                     ConfirmAction::PurgeEntry(id) => ConfirmAction::PurgeEntry(id.clone()),
+                                    ConfirmAction::PurgeTrash => ConfirmAction::PurgeTrash,
                                 });
                                 close = true;
                             }

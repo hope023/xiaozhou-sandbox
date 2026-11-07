@@ -24,6 +24,7 @@ const DEPS: &[Dep] = &[
     Dep { name: "zeroize", license: "Apache-2.0 OR MIT", what: "密钥离开作用域时抹零" },
     Dep { name: "ed25519-dalek", license: "BSD-3-Clause", what: "授权文件签名校验" },
     Dep { name: "image", license: "MIT OR Apache-2.0", what: "图片解码（png/jpeg/gif/webp/bmp）" },
+    Dep { name: "vp8-decoder", license: "(MIT OR Apache-2.0) AND BSD-3-Clause", what: "VP8 视频解码（纯 Rust；Windows 只带 VP9）" },
     Dep { name: "mime_guess", license: "MIT", what: "按扩展名判断类型" },
     Dep { name: "base64", license: "MIT OR Apache-2.0", what: "编码" },
     Dep { name: "uuid", license: "Apache-2.0 OR MIT", what: "条目与密文块标识" },

@@ -65,6 +65,8 @@ pub struct Shared {
     error: Mutex<Option<String>>,
     latest: Mutex<Option<Arc<Frame>>>,
     size: Mutex<(usize, usize)>,
+    /// 文件里有没有视频轨。false 就是纯音频（mp3/m4a/flac/wav…）。
+    has_video: AtomicBool,
 }
 
 impl Shared {
@@ -79,6 +81,7 @@ impl Shared {
             error: Mutex::new(None),
             latest: Mutex::new(None),
             size: Mutex::new((0, 0)),
+            has_video: AtomicBool::new(false),
         }
     }
 }
@@ -110,6 +113,11 @@ impl Player {
 
     pub fn size(&self) -> (usize, usize) {
         *self.sh.size.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 有没有视频轨。false 表示纯音频：没有画面，只有底部控制条。
+    pub fn has_video(&self) -> bool {
+        self.sh.has_video.load(Ordering::Relaxed)
     }
 
     pub fn is_paused(&self) -> bool {
@@ -338,48 +346,69 @@ unsafe fn run(src: Arc<dyn Source>, sh: &Shared) {
     };
 
     let _ = reader.SetStreamSelection(ALL_STREAMS, false);
-    if reader.SetStreamSelection(FIRST_VIDEO, true).is_err() {
-        fail(sh, "这个文件里没有视频轨");
-        return;
-    }
 
-    let Ok(mt) = MFCreateMediaType() else {
-        fail(sh, "创建输出格式失败");
-        return;
-    };
-    let _ = mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video);
-    let _ = mt.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32);
-    let _ = mt.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32);
-    let _ = mt.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1);
+    // 先看有没有视频轨。没有就当纯音频播：mp3/m4a/flac/wav 都走这条路。
+    let has_video = reader.SetStreamSelection(FIRST_VIDEO, true).is_ok();
+    sh.has_video.store(has_video, Ordering::Relaxed);
 
-    // 处理器不认缩放尺寸就退回原尺寸
-    let accepted = reader.SetCurrentMediaType(FIRST_VIDEO, None, &mt).is_ok() || {
-        let Ok(mt2) = MFCreateMediaType() else {
+    let (mut w, mut h) = (0usize, 0usize);
+    // 系统没有 VP8 解码器时，改用自带的纯 Rust 解码器（透传压缩帧）
+    let mut vp8: Option<vp8_decoder::Decoder> = None;
+    if has_video {
+        let Ok(mt) = MFCreateMediaType() else {
             fail(sh, "创建输出格式失败");
             return;
         };
-        let _ = mt2.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video);
-        let _ = mt2.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32);
-        let _ = mt2.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32);
-        reader.SetCurrentMediaType(FIRST_VIDEO, None, &mt2).is_ok()
-    };
-    if !accepted {
-        let codec = reader
-            .GetNativeMediaType(FIRST_VIDEO, 0)
-            .ok()
-            .and_then(|m| m.GetGUID(&MF_MT_SUBTYPE).ok())
-            .map(|g| fourcc(g.data1))
-            .unwrap_or_else(|| "未知".into());
-        fail(sh, &missing_codec_hint(&codec));
-        return;
-    }
+        let _ = mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+        let _ = mt.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32);
+        let _ = mt.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32);
+        let _ = mt.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1);
 
-    let (mut w, mut h) = read_size(&reader).unwrap_or((0, 0));
-    if w == 0 || h == 0 {
-        fail(sh, "拿不到视频尺寸");
+        // 处理器不认缩放尺寸就退回原尺寸
+        let accepted = reader.SetCurrentMediaType(FIRST_VIDEO, None, &mt).is_ok() || {
+            let Ok(mt2) = MFCreateMediaType() else {
+                fail(sh, "创建输出格式失败");
+                return;
+            };
+            let _ = mt2.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+            let _ = mt2.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32);
+            let _ = mt2.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32);
+            reader.SetCurrentMediaType(FIRST_VIDEO, None, &mt2).is_ok()
+        };
+        if !accepted {
+            let codec = reader
+                .GetNativeMediaType(FIRST_VIDEO, 0)
+                .ok()
+                .and_then(|m| m.GetGUID(&MF_MT_SUBTYPE).ok())
+                .map(|g| fourcc(g.data1))
+                .unwrap_or_else(|| "未知".into());
+            // Windows 只带 VP9 解码器，VP8 一律走自带的纯 Rust 解码：
+            // 让 MF 透传压缩帧，解码和 YUV→RGB 都在我们这边做。
+            if codec == "VP80" {
+                if setup_vp8_passthrough(&reader) {
+                    vp8 = Some(vp8_decoder::Decoder::new());
+                } else {
+                    fail(sh, "这个 VP8 视频读不出来（容器不支持透传压缩帧）");
+                    return;
+                }
+            } else {
+                fail(sh, &missing_codec_hint(&codec));
+                return;
+            }
+        } else {
+            let (rw, rh) = read_size(&reader).unwrap_or((0, 0));
+            if rw == 0 || rh == 0 {
+                fail(sh, "拿不到视频尺寸");
+                return;
+            }
+            w = rw;
+            h = rh;
+            *sh.size.lock().unwrap_or_else(|e| e.into_inner()) = (w, h);
+        }
+    } else if reader.SetStreamSelection(FIRST_AUDIO, true).is_err() {
+        fail(sh, "这个文件里既没有视频轨也没有音轨");
         return;
     }
-    *sh.size.lock().unwrap_or_else(|e| e.into_inner()) = (w, h);
 
     if let Ok(pv) = reader.GetPresentationAttribute(MEDIA_SOURCE, &MF_PD_DURATION) {
         let ticks = pv.Anonymous.Anonymous.Anonymous.uhVal;
@@ -389,6 +418,11 @@ unsafe fn run(src: Arc<dyn Source>, sh: &Shared) {
     }
 
     let mut audio = setup_audio(&reader);
+    // 纯音频文件没有声音输出就没得播了；视频没声音仍能放画面，不算错。
+    if audio.is_none() && !has_video {
+        fail(sh, "音频输出打不开：系统没有可用的播放设备，或这个音频格式解不了");
+        return;
+    }
 
     let mut stride: i32 = (w * 4) as i32;
     let mut clock_base: u64 = 0;
@@ -419,6 +453,10 @@ unsafe fn run(src: Arc<dyn Source>, sh: &Shared) {
             {
                 if let Some(a) = audio.as_mut() {
                     a.reset(want as u64);
+                }
+                // VP8 解码器有参考帧状态，跳转后必须从头等关键帧
+                if let Some(d) = vp8.as_mut() {
+                    d.reset();
                 }
                 clock_base = want as u64;
                 wall = Instant::now();
@@ -457,8 +495,12 @@ unsafe fn run(src: Arc<dyn Source>, sh: &Shared) {
         }
 
         // ── 视频：取下一帧 ──
-        if pending.is_none() && !video_done {
-            match read_video(&reader, &mut w, &mut h, &mut stride, sh) {
+        if has_video && pending.is_none() && !video_done {
+            let read = match vp8.as_mut() {
+                Some(dec) => read_vp8(&reader, dec, sh),
+                None => read_video(&reader, &mut w, &mut h, &mut stride, sh),
+            };
+            match read {
                 VideoRead::Frame(pts, frame) => pending = Some((pts, frame)),
                 VideoRead::End => video_done = true,
                 VideoRead::Skip => {}
@@ -494,7 +536,23 @@ unsafe fn run(src: Arc<dyn Source>, sh: &Shared) {
                 }
             }
             None => {
-                if video_done {
+                if !has_video {
+                    // 纯音频：没有画面可等，用声卡实际播到的位置驱动进度条。
+                    if let Some(a) = audio.as_ref() {
+                        if a.ended() && a.queued_ms() == 0 {
+                            if !sh.ended.load(Ordering::Relaxed) {
+                                sh.ended.store(true, Ordering::Relaxed);
+                                sh.pos_ms.store(
+                                    sh.duration_ms.load(Ordering::Relaxed),
+                                    Ordering::Relaxed,
+                                );
+                            }
+                        } else {
+                            sh.pos_ms.store(a.position_ms(), Ordering::Relaxed);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(15));
+                } else if video_done {
                     let (a_ended, queued) = match audio.as_ref() {
                         Some(a) => (a.ended(), a.queued_ms()),
                         None => (true, 0),
@@ -613,6 +671,127 @@ unsafe fn read_video(
         Some((rgba, ow, oh)) => VideoRead::Frame(pts_ms, Arc::new(Frame { pts_ms, w: ow, h: oh, rgba })),
         None => VideoRead::Skip,
     }
+}
+
+/// 让 Media Foundation 只解复用、不解码：把视频流设成它本来的压缩格式（VP8）。
+unsafe fn setup_vp8_passthrough(reader: &IMFSourceReader) -> bool {
+    let Ok(native) = reader.GetNativeMediaType(FIRST_VIDEO, 0) else {
+        return false;
+    };
+    reader.SetCurrentMediaType(FIRST_VIDEO, None, &native).is_ok()
+}
+
+/// 取一帧压缩 VP8 → 纯 Rust 解码 → RGBA。时间戳沿用容器里的 pts，A/V 同步不变。
+unsafe fn read_vp8(
+    reader: &IMFSourceReader,
+    dec: &mut vp8_decoder::Decoder,
+    sh: &Shared,
+) -> VideoRead {
+    let mut actual = 0u32;
+    let mut flags = 0u32;
+    let mut ts = 0i64;
+    let mut sample: Option<IMFSample> = None;
+    if reader
+        .ReadSample(
+            FIRST_VIDEO,
+            0,
+            Some(&mut actual),
+            Some(&mut flags),
+            Some(&mut ts),
+            Some(&mut sample),
+        )
+        .is_err()
+    {
+        return VideoRead::Err("读取视频帧失败".into());
+    }
+    if flags & FLAG_EOS != 0 {
+        return VideoRead::End;
+    }
+    if flags & FLAG_TYPE_CHANGED != 0 {
+        return VideoRead::Skip;
+    }
+    let Some(sample) = sample else {
+        return VideoRead::Skip;
+    };
+    let pts_ms = (ts.max(0) as u64) / 10_000;
+
+    let Ok(buf) = sample.ConvertToContiguousBuffer() else {
+        return VideoRead::Skip;
+    };
+    let mut ptr: *mut u8 = std::ptr::null_mut();
+    let mut len = 0u32;
+    if buf.Lock(&mut ptr, None, Some(&mut len)).is_err() || ptr.is_null() || len == 0 {
+        let _ = buf.Unlock();
+        return VideoRead::Skip;
+    }
+    let data = std::slice::from_raw_parts(ptr, len as usize);
+    let decoded = dec.decode(data);
+    let _ = buf.Unlock();
+
+    match decoded {
+        Ok(Some(pic)) => {
+            let (pw, ph) = (pic.width as usize, pic.height as usize);
+            let i420 = pic.to_i420();
+            let Some((rgba, ow, oh)) = i420_to_rgba(&i420, pw, ph) else {
+                return VideoRead::Skip;
+            };
+            *sh.size.lock().unwrap_or_else(|e| e.into_inner()) = (ow, oh);
+            VideoRead::Frame(
+                pts_ms,
+                Arc::new(Frame { pts_ms, w: ow, h: oh, rgba }),
+            )
+        }
+        // 只更新参考帧的隐藏帧
+        Ok(None) => VideoRead::Skip,
+        // 跳转后还没等到关键帧，丢掉继续读
+        Err(vp8_decoder::DecodeError::NeedKeyframe) => VideoRead::Skip,
+        Err(e) => VideoRead::Err(format!("VP8 解码失败：{e}")),
+    }
+}
+
+/// I420（BT.601 limited range）→ RGBA。超宽的源在这里整数倍抽样降采样，
+/// 和系统解码那条路的 `MAX_OUT_W` 行为保持一致。
+fn i420_to_rgba(i420: &[u8], w: usize, h: usize) -> Option<(Vec<u8>, usize, usize)> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
+    let ysize = w * h;
+    let csize = cw * ch;
+    if i420.len() < ysize + 2 * csize {
+        return None;
+    }
+    let (yd, rest) = i420.split_at(ysize);
+    let (ud, vd) = rest.split_at(csize);
+
+    let step = w.div_ceil(MAX_OUT_W).max(1);
+    let ow = w / step;
+    let oh = h / step;
+    if ow == 0 || oh == 0 {
+        return None;
+    }
+    let mut out = vec![0u8; ow * oh * 4];
+    for y in 0..oh {
+        let sy = y * step;
+        for x in 0..ow {
+            let sx = x * step;
+            let yy = yd[sy * w + sx] as i32;
+            let ci = (sy / 2) * cw + (sx / 2);
+            let u = ud[ci] as i32 - 128;
+            let v = vd[ci] as i32 - 128;
+            let c = (yy - 16).max(0) * 298;
+            let r = ((c + 409 * v + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((c - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
+            let b = ((c + 516 * u + 128) >> 8).clamp(0, 255) as u8;
+            let j = (y * ow + x) * 4;
+            out[j] = r;
+            out[j + 1] = g;
+            out[j + 2] = b;
+            out[j + 3] = 255;
+        }
+    }
+    Some((out, ow, oh))
 }
 
 unsafe fn read_sample(reader: &IMFSourceReader, stream: u32) -> SampleRead {
@@ -937,6 +1116,53 @@ mod tests {
         Arc::new(FileSource { f: Mutex::new(f), size })
     }
 
+    /// 生成一段单声道 16-bit PCM 的 WAV（静音），用来验证纯音频路径。
+    fn write_test_wav(path: &std::path::Path, rate: u32, ms: u32) {
+        let samples = rate as u64 * ms as u64 / 1000;
+        let data_len = (samples * 2) as u32;
+        let mut out = Vec::with_capacity(44 + data_len as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&1u16.to_le_bytes()); // 单声道
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&(rate * 2).to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.resize(44 + data_len as usize, 0);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// 纯音频文件（没有视频轨）也要能开：能识别出没画面，时长读得到。
+    /// 本机没有声卡时只验证到「识别为音频」为止，不把测试搞成必须插耳机。
+    #[test]
+    fn audio_only_file_is_recognized() {
+        let path = std::env::temp_dir().join("xz-audio-probe.wav");
+        write_test_wav(&path, 44_100, 1000);
+        let p = Player::open(file_source(path.to_str().unwrap()));
+
+        for _ in 0..100 {
+            if p.duration_ms() > 0 || p.error().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!p.has_video(), "wav 不该被当成视频");
+        assert!(
+            p.duration_ms() >= 900 && p.duration_ms() <= 1200,
+            "时长不对：{}",
+            p.duration_ms()
+        );
+        if let Some(e) = p.error() {
+            // 没有输出设备是环境问题，但提示得说人话
+            assert!(e.contains("音频"), "错误信息不明确：{e}");
+        }
+    }
+
     /// 用真实文件验证解码链路。没有样本时直接跳过：
     ///   XZ_TEST_VIDEO=D:/some/clip.mp4 cargo test decodes_real
     #[test]
@@ -961,6 +1187,52 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         panic!("等不到首帧");
+    }
+
+    /// VP8 走自带解码器（MF 只解复用）。没有样本时跳过：
+    ///   XZ_TEST_VP8=D:/path/clip.webm cargo test decodes_vp8 -- --nocapture
+    #[test]
+    fn decodes_vp8_when_sample_given() {
+        let Ok(path) = std::env::var("XZ_TEST_VP8") else {
+            return;
+        };
+        if std::fs::File::open(&path).is_err() {
+            return;
+        }
+        let p = Player::open(file_source(&path));
+        for _ in 0..200 {
+            if let Some(f) = p.take_frame() {
+                assert!(f.w > 0 && f.h > 0, "尺寸异常");
+                assert_eq!(f.rgba.len(), f.w * f.h * 4, "RGBA 长度不对");
+                assert!(p.duration_ms() > 0, "时长没读到");
+                assert!(
+                    f.rgba.chunks(4).any(|px| px[0] > 8 || px[1] > 8 || px[2] > 8),
+                    "画面全黑，VP8 解码可能没真正跑起来"
+                );
+                return;
+            }
+            if let Some(e) = p.error() {
+                panic!("VP8 解码失败：{e}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("等不到 VP8 首帧");
+    }
+
+    /// YUV 中性灰（Y=126, U=V=128）应该转成接近灰色的 RGB。
+    #[test]
+    fn i420_gray_converts_to_gray() {
+        let (w, h) = (4usize, 4usize);
+        let mut i420 = vec![126u8; w * h];
+        i420.extend(std::iter::repeat(128u8).take(4)); // U
+        i420.extend(std::iter::repeat(128u8).take(4)); // V
+        let (rgba, ow, oh) = i420_to_rgba(&i420, w, h).unwrap();
+        assert_eq!((ow, oh), (w, h));
+        for px in rgba.chunks(4) {
+            assert!(px[0].abs_diff(px[1]) <= 2 && px[1].abs_diff(px[2]) <= 2, "不是灰色");
+            assert!(px[0] > 120 && px[0] < 136, "亮度不对：{}", px[0]);
+            assert_eq!(px[3], 255);
+        }
     }
 
     /// 拖动进度条、播完再重播。没有样本时跳过：

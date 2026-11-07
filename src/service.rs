@@ -577,6 +577,11 @@ pub fn purge_entry(state: &AppState, id: &str) -> Result<()> {
     state.write(|v| v.purge_entry(id))
 }
 
+/// 清空回收站，返回销毁的条目数。
+pub fn purge_trash(state: &AppState) -> Result<usize> {
+    state.write(|v| v.purge_trash())
+}
+
 // ─────────────────────────── 版本历史 ───────────────────────────
 
 pub fn list_versions(state: &AppState, id: &str) -> Result<Vec<VersionView>> {

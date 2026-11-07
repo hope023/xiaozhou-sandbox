@@ -34,6 +34,7 @@ impl App {
                     (Nav::Dir, Icon::Folder, "全部文件", Some(file_count)),
                     (Nav::Image, Icon::Image, "图片", None),
                     (Nav::Video, Icon::Video, "视频", None),
+                    (Nav::Audio, Icon::Audio, "音频", None),
                     (Nav::Text, Icon::Text, "文档", None),
                     (Nav::Trash, Icon::Trash, "回收站", None),
                 ] {

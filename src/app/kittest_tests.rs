@@ -607,6 +607,8 @@ fn tabs_keep_their_own_state() {
         phase: "已加密写入",
     });
 
+    // 锁住第一个页签，否则打开第二个时会把它顶掉
+    app.toggle_pin(0);
     app.select(Some(entries[1].clone()));
     assert_eq!(app.tabs.len(), 2, "两个文件应该开两个页签");
     assert_eq!(app.active, 1);
@@ -627,4 +629,197 @@ fn tabs_keep_their_own_state() {
     app.close_tab(0);
     assert!(app.tabs.is_empty());
     assert!(app.selected.is_none());
+}
+/// 生成一段静音 PCM WAV，供音频预览测试用。
+fn write_silent_wav(path: &std::path::Path, rate: u32, ms: u32) {
+    let samples = rate as u64 * ms as u64 / 1000;
+    let data_len = (samples * 2) as u32;
+    let mut out = Vec::with_capacity(44 + data_len as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * 2).to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    out.resize(44 + data_len as usize, 0);
+    std::fs::write(path, out).unwrap();
+}
+
+/// 回归：纯音频文件要进播放器（占位卡 + 控制条），不能落到「不支持预览」页。
+#[test]
+fn kittest_audio_preview_plays() {
+    let dir = std::env::temp_dir().join("xv-kittest-audio");
+    let _ = std::fs::remove_dir_all(&dir);
+    vault::create(&dir, PW, None).unwrap();
+    let dek = vault::unlock(&dir, PW).unwrap();
+    let mut v = store::Vault::open(dir.clone(), dek).unwrap();
+    let wav = dir.join("tone.wav");
+    write_silent_wav(&wav, 44_100, 1000);
+    v.import_file("root", "tone.wav", &wav).unwrap();
+    v.save_index().unwrap();
+
+    let (mut harness, _state) = make_app(dir);
+    harness.run_steps(3);
+    harness
+        .get(By::new().role(egui::accesskit::Role::PasswordInput))
+        .type_text(PW);
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(10);
+
+    if let Some(node) = harness.query(By::new().label("tone.wav")) {
+        node.click();
+    }
+    harness.run_steps(5);
+
+    // 等播放器起来并读到时长
+    for _ in 0..60 {
+        let ready = harness
+            .state()
+            .video
+            .player
+            .as_ref()
+            .is_some_and(|p| p.duration_ms() > 0 || p.error().is_some());
+        if ready {
+            break;
+        }
+        harness.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+
+    let p = harness.state().video.player.as_ref().expect("播放器没起来");
+    assert!(!p.has_video(), "wav 不该被当成视频");
+    assert!(p.duration_ms() > 0, "时长没读到");
+
+    // 有输出设备时才验证播放/暂停；没设备时播放器会给提示，跳过按键部分。
+    if p.error().is_none() {
+        harness.key_press(egui::Key::Space);
+        harness.run_steps(3);
+        assert!(
+            harness.state().video.player.as_ref().unwrap().is_paused(),
+            "空格应该暂停"
+        );
+    }
+}
+
+/// 页签锁定：没锁的页签会被新打开的文件顶掉，锁定的始终保留。
+#[test]
+fn pinned_tab_survives_new_open() {
+    let dir = setup_vault("pintab");
+    let state = Arc::new(AppState::default());
+    *state.config.lock().unwrap() = Config {
+        vault_path: dir.display().to_string(),
+        ..Default::default()
+    };
+    service::open_vault_at(&state, &dir.display().to_string()).unwrap();
+    service::unlock(&state, PW).unwrap();
+
+    // 再导入两个文件，凑够三个
+    let src = std::env::temp_dir().join("xv-kittest-pin-src");
+    let _ = std::fs::remove_dir_all(&src);
+    std::fs::create_dir_all(&src).unwrap();
+    for name in ["second.txt", "third.txt"] {
+        let p = src.join(name);
+        std::fs::write(&p, name).unwrap();
+        service::import_paths(&state, &[p.display().to_string()], "root").unwrap();
+    }
+
+    let mut app = App::new(Arc::clone(&state), egui::Context::default());
+    let entries = service::list_dir(&state, "root").unwrap();
+    let find = |n: &str| entries.iter().find(|e| e.name == n).unwrap().clone();
+
+    // 打开 A（临时页签），再打开 B：A 被顶掉，只剩一个页签
+    app.select(Some(find("hello.txt")));
+    app.select(Some(find("second.txt")));
+    assert_eq!(app.tabs.len(), 1, "未锁定的页签应该被顶掉");
+    assert_eq!(app.tabs[0].entry.name, "second.txt");
+
+    // 锁定 B，再打开 C：B 保留，C 是新的临时页签
+    app.toggle_pin(0);
+    app.select(Some(find("third.txt")));
+    assert_eq!(app.tabs.len(), 2);
+    assert!(app.tabs[0].pinned && app.tabs[0].entry.name == "second.txt", "锁定的页签要排在最左");
+    assert!(!app.tabs[1].pinned && app.tabs[1].entry.name == "third.txt");
+
+    // 再打开 A：顶掉临时页签 C，锁定的 B 还在
+    app.select(Some(find("hello.txt")));
+    assert_eq!(app.tabs.len(), 2);
+    assert!(app.tabs.iter().any(|t| t.pinned && t.entry.name == "second.txt"));
+    assert!(app.tabs.iter().any(|t| !t.pinned && t.entry.name == "hello.txt"));
+    assert!(!app.tabs.iter().any(|t| t.entry.name == "third.txt"));
+
+    // 锁定 A 之后两个都在锁定块；再打开 C 追加到后面
+    app.toggle_pin(1);
+    assert!(app.tabs[0].pinned && app.tabs[1].pinned, "锁定的页签应该连成一块");
+    app.select(Some(find("third.txt")));
+    assert_eq!(app.tabs.len(), 3);
+    assert_eq!(app.tabs[2].entry.name, "third.txt");
+
+    // 解锁最左边的 B：它应该移到锁定块之后，激活的 C 不受影响
+    app.toggle_pin(0);
+    assert_eq!(app.tabs[0].entry.name, "hello.txt", "剩下的锁定页签要顶到最左");
+    assert_eq!(app.tabs[1].entry.name, "second.txt", "解锁的页签排到锁定块之后");
+    assert!(!app.tabs[1].pinned);
+    assert_eq!(app.tabs[2].entry.name, "third.txt");
+    assert_eq!(app.active, 2, "重排不能把激活的页签换掉");
+}
+
+
+
+/// 回收站：「清空回收站」按钮只在有东西时出现，点了要过确认弹窗，确认后整批销毁。
+#[test]
+fn kittest_trash_empty_button_flow() {
+    let dir = setup_vault("trash-empty");
+    let (mut harness, state) = make_app(dir);
+
+    harness.run_steps(2);
+    let pw_node = harness.get(By::new().role(egui::accesskit::Role::PasswordInput));
+    pw_node.type_text(PW);
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(10);
+
+    // 回收站空着：不该有「清空回收站」按钮
+    harness
+        .get(By::new().role(egui::accesskit::Role::Button).label("回收站"))
+        .click();
+    harness.run_steps(3);
+    harness.get(By::new().label("回收站是空的"));
+    assert!(
+        harness.query(By::new().label("清空回收站")).is_none(),
+        "空回收站不该出现清空按钮"
+    );
+
+    // 删掉唯一的文件，回收站里有一项，按钮出现
+    let id = service::list_dir(&state, "root").unwrap()[0].id.clone();
+    service::delete_entry(&state, &id).unwrap();
+    harness.state_mut().need_list = true;
+    harness.run_steps(3);
+    harness
+        .render()
+        .unwrap()
+        .save("target/kittest-trash-filled.png")
+        .unwrap();
+    harness.get(By::new().label("清空回收站")).click();
+    harness.run_steps(2);
+
+    // 弹窗先拦一道，此时条目还在
+    harness.get(By::new().label_contains("永久销毁"));
+    harness
+        .render()
+        .unwrap()
+        .save("target/kittest-trash-confirm.png")
+        .unwrap();
+    assert_eq!(service::list_trash(&state).unwrap().len(), 1, "确认前不能删");
+
+    harness.get(By::new().label("清空")).click();
+    harness.run_steps(3);
+    assert!(service::list_trash(&state).unwrap().is_empty(), "确认后回收站应清空");
+    harness.get(By::new().label("回收站是空的"));
+
+    harness.render().unwrap().save("target/kittest-trash.png").unwrap();
 }

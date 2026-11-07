@@ -468,6 +468,33 @@ impl Vault {
         self.save_index()
     }
 
+    /// 清空回收站：把所有 `deleted_at` 有值的条目连同历史版本一起销毁。
+    /// 返回销毁的条目数。
+    pub fn purge_trash(&mut self) -> Result<usize> {
+        let ids: Vec<String> = self
+            .index
+            .entries
+            .values()
+            .filter(|e| e.deleted_at.is_some())
+            .map(|e| e.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        for id in &ids {
+            if let Some(e) = self.index.entries.get(id) {
+                for v in &e.versions {
+                    self.remove_blob(&v.blob);
+                }
+            }
+        }
+        for id in &ids {
+            self.index.entries.remove(id);
+        }
+        self.save_index()?;
+        Ok(ids.len())
+    }
+
     fn subtree_ids(&self, id: &str) -> Vec<String> {
         let mut out = vec![id.to_string()];
         let mut i = 0;

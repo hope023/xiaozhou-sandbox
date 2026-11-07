@@ -157,7 +157,7 @@ impl App {
                 match e.preview.as_str() {
                     "text" => self.show_text_editor(ui),
                     "image" => self.show_image(ui, &e),
-                    "video" => self.show_video(ui, &e),
+                    "video" | "audio" => self.show_video(ui, &e),
                     _ => self.show_media_stub(ui, &e),
                 }
         }
@@ -175,6 +175,7 @@ impl App {
 
         let mut activate: Option<usize> = None;
         let mut close: Option<usize> = None;
+        let mut toggle_pin: Option<usize> = None;
 
         egui::ScrollArea::horizontal()
             .id_salt("insp-tabs")
@@ -184,12 +185,13 @@ impl App {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     for i in 0..self.tabs.len() {
                         let active = i == self.active;
+                        let pinned = self.tabs[i].pinned;
                         let name = short_name(&self.tabs[i].entry.name, 10);
                         let kind = self.tabs[i].entry.kind.clone();
                         let preview = self.tabs[i].entry.preview.clone();
 
                         let (rect, resp) =
-                            ui.allocate_exact_size(Vec2::new(132.0, 26.0), egui::Sense::click());
+                            ui.allocate_exact_size(Vec2::new(148.0, 26.0), egui::Sense::click());
                         let bg = if active { theme::PANEL } else { theme::BG };
                         ui.painter().rect_filled(rect, CornerRadius::same(7), bg);
                         if active {
@@ -210,8 +212,11 @@ impl App {
                             ink,
                             13.0,
                         );
-                        // 名字裁在页签里，别让它横着长出去
-                        let clip = ui.painter().with_clip_rect(rect.shrink2(Vec2::new(8.0, 0.0)));
+                        // 名字裁在页签里，右边给图钉和 × 留位置
+                        let clip = ui.painter().with_clip_rect(egui::Rect::from_min_max(
+                            rect.min,
+                            egui::pos2(rect.right() - 40.0, rect.bottom()),
+                        ));
                         clip.text(
                             egui::pos2(rect.left() + 25.0, rect.center().y),
                             egui::Align2::LEFT_CENTER,
@@ -219,6 +224,33 @@ impl App {
                             egui::FontId::proportional(12.0),
                             if active { theme::TEXT } else { theme::MUTED },
                         );
+
+                        // 图钉：锁定的页签常显，其余在悬停时露出来
+                        let pin_rect = egui::Rect::from_center_size(
+                            egui::pos2(rect.right() - 31.0, rect.center().y),
+                            Vec2::splat(18.0),
+                        );
+                        let mut pin_clicked = false;
+                        if pinned || active || resp.hovered() {
+                            let pin_resp = ui
+                                .interact(pin_rect, ui.id().with(("tab-pin", i)), egui::Sense::click())
+                                .on_hover_text(if pinned {
+                                    "取消锁定：打开新文件时会被顶掉"
+                                } else {
+                                    "锁定页签：打开新文件时保留"
+                                });
+                            if pin_resp.hovered() {
+                                ui.painter().circle_filled(pin_rect.center(), 8.0, theme::LINE);
+                            }
+                            widgets::icon(
+                                ui.painter(),
+                                pin_rect.center(),
+                                Icon::Pin,
+                                if pinned { theme::ACCENT } else { theme::FAINT },
+                                11.0,
+                            );
+                            pin_clicked = pin_resp.clicked();
+                        }
 
                         // × 只在当前页签或悬停时出现，平时不抢视觉
                         let close_rect = egui::Rect::from_center_size(
@@ -244,6 +276,8 @@ impl App {
                         }
                         if close_resp.clicked() {
                             close = Some(i);
+                        } else if pin_clicked {
+                            toggle_pin = Some(i);
                         } else if resp.clicked() {
                             activate = Some(i);
                         }
@@ -257,6 +291,8 @@ impl App {
                 self.flush_editor();
             }
             self.close_tab(i);
+        } else if let Some(i) = toggle_pin {
+            self.toggle_pin(i);
         } else if let Some(i) = activate {
             self.activate_tab(i);
         }
@@ -446,9 +482,10 @@ impl App {
         }
     }
 
-    /// 视频：读完整字节 → Media Foundation 内存解码 → 逐帧上纹理。
+    /// 视频/音频：读完整字节 → Media Foundation 内存解码 → 逐帧上纹理或直接出声。
     /// 明文全程只在内存里，不写临时文件。
     fn show_video(&mut self, ui: &mut egui::Ui, e: &crate::service::EntryView) {
+        let is_audio = e.preview == "audio";
         if self.video.for_id != e.id {
             self.video = VideoState { for_id: e.id.clone(), ..Default::default() };
             let st = Arc::clone(&self.state);
@@ -489,9 +526,11 @@ impl App {
             ui.vertical_centered(|ui| {
                 ui.add_space(30.0);
                 let (rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), egui::Sense::hover());
-                widgets::icon(ui.painter(), rect.center(), Icon::Video, theme::FAINT, 36.0);
+                let icon = if is_audio { Icon::Audio } else { Icon::Video };
+                widgets::icon(ui.painter(), rect.center(), icon, theme::FAINT, 36.0);
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new("这段视频没法内嵌播放").size(13.5).color(theme::TEXT));
+                let title = if is_audio { "这段音频没法内嵌播放" } else { "这段视频没法内嵌播放" };
+                ui.label(egui::RichText::new(title).size(13.5).color(theme::TEXT));
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(err).size(12.0).color(theme::MUTED));
                 ui.add_space(12.0);
@@ -604,42 +643,68 @@ impl App {
             player.seek_ms(ms);
         }
 
-        // ── 画面 ──
-        if let Some(frame) = player.take_frame() {
-            let img = egui::ColorImage::from_rgba_unmultiplied([frame.w, frame.h], &frame.rgba);
-            let tex = ui.ctx().load_texture(
-                "video-frame",
-                img,
-                egui::TextureOptions::LINEAR,
-            );
-            self.video.texture = Some((e.id.clone(), tex));
-        }
-
-        match &self.video.texture {
-            Some((tid, tex)) if *tid == e.id => {
-                let (vw, vh) = player.size();
-                let avail = ui.available_size();
-                let scale = if vw > 0 && vh > 0 {
-                    (avail.x / vw as f32).min(avail.y / vh as f32).max(0.01)
-                } else {
-                    1.0
-                };
-                let size = Vec2::new(vw as f32 * scale, vh as f32 * scale);
-                ui.centered_and_justified(|ui| {
-                    ui.add(
-                        egui::Image::from_texture(tex)
-                            .fit_to_exact_size(size)
-                            .corner_radius(CornerRadius::same(6)),
-                    );
-                });
-            }
-            _ => {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.spinner();
+        // ── 画面（纯音频没有画面，显示一张占位卡） ──
+        if !player.has_video() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(36.0);
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(76.0), egui::Sense::hover());
+                widgets::icon(ui.painter(), rect.center(), Icon::Audio, theme::FAINT, 62.0);
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · {}",
+                        if e.mime.is_empty() { "音频" } else { e.mime.as_str() },
+                        widgets::fmt_size(e.size)
+                    ))
+                    .size(12.0)
+                    .color(theme::MUTED),
+                );
+                if ended {
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new("首帧解码中…").size(12.0).color(theme::MUTED));
-                });
+                    ui.label(
+                        egui::RichText::new("已播完，点播放从头开始")
+                            .size(11.5)
+                            .color(theme::FAINT),
+                    );
+                }
+            });
+        } else {
+            if let Some(frame) = player.take_frame() {
+                let img = egui::ColorImage::from_rgba_unmultiplied([frame.w, frame.h], &frame.rgba);
+                let tex = ui.ctx().load_texture(
+                    "video-frame",
+                    img,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.video.texture = Some((e.id.clone(), tex));
+            }
+
+            match &self.video.texture {
+                Some((tid, tex)) if *tid == e.id => {
+                    let (vw, vh) = player.size();
+                    let avail = ui.available_size();
+                    let scale = if vw > 0 && vh > 0 {
+                        (avail.x / vw as f32).min(avail.y / vh as f32).max(0.01)
+                    } else {
+                        1.0
+                    };
+                    let size = Vec2::new(vw as f32 * scale, vh as f32 * scale);
+                    ui.centered_and_justified(|ui| {
+                        ui.add(
+                            egui::Image::from_texture(tex)
+                                .fit_to_exact_size(size)
+                                .corner_radius(CornerRadius::same(6)),
+                        );
+                    });
+                }
+                _ => {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.spinner();
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("首帧解码中…").size(12.0).color(theme::MUTED));
+                    });
+                }
             }
         }
 
@@ -692,7 +757,7 @@ impl App {
             );
             ui.add_space(10.0);
             ui.label(
-                egui::RichText::new("这一版不做内嵌播放。导出是你主动把明文写到磁盘，其余时间磁盘上只有密文。")
+                egui::RichText::new("这种格式没有内嵌预览。导出是你主动把明文写到磁盘，其余时间磁盘上只有密文。")
                     .size(12.0)
                     .color(theme::MUTED),
             );
