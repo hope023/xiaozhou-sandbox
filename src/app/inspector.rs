@@ -11,6 +11,7 @@ impl App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::PANEL).inner_margin(egui::Margin::same(12)))
             .show(ui, |ui| {
+                self.show_tab_bar(ui);
                 let Some(e) = self.selected.clone() else {
                     widgets::empty_state(
                         ui,
@@ -61,6 +62,10 @@ impl App {
     }
 
     fn inspector_body(&mut self, ui: &mut egui::Ui, e: &crate::service::EntryView) {
+        // 选中文件就开始查重（后台线程，结论到了角标自己会变）
+        if e.kind == "file" && e.deleted_at.is_none() {
+            self.ensure_dup_check(&e.id);
+        }
         {
             // ── 头部：标题/改名 + 操作按钮 ──
             ui.horizontal(|ui| {
@@ -75,6 +80,12 @@ impl App {
                         if self.rename_focus_pending {
                             resp.request_focus();
                             self.rename_focus_pending = false;
+                            // 焦点真正落到输入框的这一帧，再确认一次输入法可用：
+                            // 点「重命名」时 hwnd 可能还没拿到，begin_rename 里那次
+                            // 补救不一定生效；这里补上就不会出现「点开了却打不了字」。
+                            if let Some(h) = self.hwnd {
+                                crate::service::ensure_ime_available(h);
+                            }
                         }
                         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             self.commit_rename(&e.id);
@@ -93,6 +104,8 @@ impl App {
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // 右上角：这份内容在库里还有没有别的副本
+                        self.dup_chip(ui, e);
                         if e.deleted_at.is_some() {
                             // 回收站里：恢复 / 彻底删除
                             if widgets::danger_button(ui, "彻底删除").clicked() {
@@ -147,6 +160,226 @@ impl App {
                     "video" => self.show_video(ui, &e),
                     _ => self.show_media_stub(ui, &e),
                 }
+        }
+    }
+
+    /// 页签栏：打开过的文件/文件夹。点切换，点 × 关闭。
+    ///
+    /// 页签是跨目录的——浏览到别的文件夹、点侧栏分类都不会把它们关掉，
+    /// 只有锁库、删除对应条目、或者手动点 × 才关。
+    fn show_tab_bar(&mut self, ui: &mut egui::Ui) {
+        self.sync_active_entry();
+        if self.tabs.is_empty() {
+            return;
+        }
+
+        let mut activate: Option<usize> = None;
+        let mut close: Option<usize> = None;
+
+        egui::ScrollArea::horizontal()
+            .id_salt("insp-tabs")
+            .max_height(28.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for i in 0..self.tabs.len() {
+                        let active = i == self.active;
+                        let name = short_name(&self.tabs[i].entry.name, 10);
+                        let kind = self.tabs[i].entry.kind.clone();
+                        let preview = self.tabs[i].entry.preview.clone();
+
+                        let (rect, resp) =
+                            ui.allocate_exact_size(Vec2::new(132.0, 26.0), egui::Sense::click());
+                        let bg = if active { theme::PANEL } else { theme::BG };
+                        ui.painter().rect_filled(rect, CornerRadius::same(7), bg);
+                        if active {
+                            ui.painter().rect_stroke(
+                                rect,
+                                CornerRadius::same(7),
+                                Stroke::new(1.0, theme::LINE),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+
+                        let icon = tab_icon(&kind, &preview);
+                        let (_, ink) = theme::tint(if kind == "dir" { "dir" } else { preview.as_str() });
+                        widgets::icon(
+                            ui.painter(),
+                            egui::pos2(rect.left() + 13.0, rect.center().y),
+                            icon,
+                            ink,
+                            13.0,
+                        );
+                        // 名字裁在页签里，别让它横着长出去
+                        let clip = ui.painter().with_clip_rect(rect.shrink2(Vec2::new(8.0, 0.0)));
+                        clip.text(
+                            egui::pos2(rect.left() + 25.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &name,
+                            egui::FontId::proportional(12.0),
+                            if active { theme::TEXT } else { theme::MUTED },
+                        );
+
+                        // × 只在当前页签或悬停时出现，平时不抢视觉
+                        let close_rect = egui::Rect::from_center_size(
+                            egui::pos2(rect.right() - 13.0, rect.center().y),
+                            Vec2::splat(18.0),
+                        );
+                        let close_resp = ui.interact(
+                            close_rect,
+                            ui.id().with(("tab-close", i)),
+                            egui::Sense::click(),
+                        );
+                        if active || resp.hovered() || close_resp.hovered() {
+                            if close_resp.hovered() {
+                                ui.painter().circle_filled(close_rect.center(), 8.0, theme::LINE);
+                            }
+                            widgets::icon(
+                                ui.painter(),
+                                close_rect.center(),
+                                Icon::X,
+                                theme::MUTED,
+                                11.0,
+                            );
+                        }
+                        if close_resp.clicked() {
+                            close = Some(i);
+                        } else if resp.clicked() {
+                            activate = Some(i);
+                        }
+                    }
+                });
+            });
+
+        if let Some(i) = close {
+            // 关掉正在编辑且有未保存内容的页签前，先落盘——关页签不等于放弃修改
+            if i == self.active && self.editor.as_ref().is_some_and(|ed| ed.dirty) {
+                self.flush_editor();
+            }
+            self.close_tab(i);
+        } else if let Some(i) = activate {
+            self.activate_tab(i);
+        }
+        ui.add_space(6.0);
+    }
+
+    /// 右上角的查重角标：这同一份内容在库里还有没有别的位置。
+    ///
+    /// 三态：算着呢 / 只有这一份 / 另有 N 份（点开列出去处，点条目跳过去）。
+    /// 只在文件上出现——文件夹没有内容可比。结论只按内容指纹（SHA-256）算，
+    /// 不猜名字：同名不同内容、同内容不同名都能分得清。
+    fn dup_chip(&mut self, ui: &mut egui::Ui, e: &crate::service::EntryView) {
+        if e.kind != "file" || e.deleted_at.is_some() {
+            return;
+        }
+
+        let pending = self.dup.for_id != e.id || self.dup.pending;
+        let big = self.dup.skipped_size;
+        let (label, fg, bg, line) = if pending {
+            ("比对中…".to_string(), theme::FAINT, theme::PANEL, theme::LINE)
+        } else if self.dup.error.is_some() {
+            ("查重失败".to_string(), theme::WARN, theme::WARN_BG, theme::WARN_LINE)
+        } else if big.is_some() {
+            // 大文件不查：与其读十几秒磁盘，不如老实说「没查」
+            ("未查重".to_string(), theme::FAINT, theme::PANEL, theme::LINE)
+        } else if self.dup.hits.is_empty() {
+            // 有同大小的旧文件没能比对时不能说「无重复」
+            let t = if self.dup.truncated > 0 { "未查全" } else { "无重复" };
+            (t.to_string(), theme::FAINT, theme::PANEL, theme::LINE)
+        } else {
+            (
+                format!("另有 {} 份", self.dup.hits.len()),
+                theme::ACCENT,
+                theme::ACCENT_SOFT,
+                theme::ACCENT_LINE,
+            )
+        };
+
+        let btn = ui.add(
+            egui::Button::new(egui::RichText::new(label).size(11.5).color(fg))
+                .fill(bg)
+                .stroke(Stroke::new(1.0, line))
+                .corner_radius(CornerRadius::same(7))
+                .min_size(Vec2::new(0.0, 22.0)),
+        );
+
+        if pending {
+            btn.on_hover_text("正在按内容指纹比对库里的其他文件（旧库里的文件要先解密算一次指纹）");
+            return;
+        }
+        if let Some(err) = self.dup.error.clone() {
+            btn.on_hover_text(format!("查重没成功：{err}"));
+            return;
+        }
+        if let Some(size) = big {
+            btn.on_hover_text(format!(
+                "这份有 {}，还没有内容指纹（旧库里的超大文件），所以没自动比对。\n现算指纹要解密整份文件，大文件是十几秒级别。",
+                widgets::fmt_size(size)
+            ));
+            return;
+        }
+        if self.dup.hits.is_empty() {
+            if self.dup.truncated > 0 {
+                btn.on_hover_text(format!(
+                    "另有 {} 份同大小的文件没能比对：旧库里没有指纹的超大文件，或一次要算的份数太多。",
+                    self.dup.truncated
+                ));
+            } else {
+                btn.on_hover_text("按内容指纹（SHA-256）比对过：库里只有这一份。");
+            }
+            return;
+        }
+
+        // 有副本：点开一份清单，逐条能跳过去。
+        // 用 Popup 而不是 tooltip——提示框里点不了，而且一移开鼠标就没了。
+        let hits = self.dup.hits.clone();
+        let truncated = self.dup.truncated;
+        let popup_id = egui::Id::new(("dup-popup", e.id.as_str()));
+        let mut goto: Option<String> = None;
+        egui::Popup::from_toggle_button_response(&btn)
+            .id(popup_id)
+            .align(egui::RectAlign::BOTTOM_END)
+            .gap(6.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .stroke(Stroke::new(1.0, theme::LINE_STRONG))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(8))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 4],
+                        blur: 12,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(20),
+                    }),
+            )
+            .show(|ui| {
+                ui.set_width(300.0);
+                ui.label(
+                    egui::RichText::new(format!("内容完全相同，还有 {} 份", hits.len()))
+                        .size(11.5)
+                        .color(theme::FAINT),
+                );
+                ui.add_space(2.0);
+                for h in &hits {
+                    if dup_row(ui, h) {
+                        goto = Some(h.id.clone());
+                    }
+                }
+                if truncated > 0 {
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(format!("另有 {truncated} 份同大小的文件没能比对"))
+                            .size(11.0)
+                            .color(theme::FAINT),
+                    );
+                }
+            });
+        if let Some(id) = goto {
+            self.open_by_id(&id);
+        }
+        if !egui::Popup::is_id_open(ui.ctx(), popup_id) {
+            btn.on_hover_text("点开看这些副本都在哪个目录");
         }
     }
 
@@ -485,6 +718,8 @@ impl App {
                     }
                 }
                 self.need_list = true;
+                // 提示里带文件名，改名后要刷一下
+                self.invalidate_duplicates();
             }
             Err(e) => self.notify(format!("重命名失败：{e}")),
         }
@@ -497,6 +732,58 @@ impl App {
     }
 }
 
+
+/// 页签上的类型图标。
+fn tab_icon(kind: &str, preview: &str) -> Icon {
+    if kind == "dir" {
+        return Icon::Folder;
+    }
+    match preview {
+        "image" => Icon::Image,
+        "video" => Icon::Video,
+        "audio" => Icon::Audio,
+        "text" => Icon::Text,
+        _ => Icon::File,
+    }
+}
+
+/// 页签宽度有限，名字按字符数截断（中文按一个字算）。
+fn short_name(name: &str, max: usize) -> String {
+    let mut s: String = name.chars().take(max).collect();
+    if name.chars().count() > max {
+        s.push('…');
+    }
+    s
+}
+
+/// 弹层里的一行副本：文件名 + 所在目录，整行可点。
+/// 手绘是为了两行用不同字号/颜色——egui 的 Button 装不下两段样式。
+fn dup_row(ui: &mut egui::Ui, h: &crate::service::DuplicateHit) -> bool {
+    let width = ui.available_width().max(240.0);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 38.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(7), theme::HOVER);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // 名字太长就裁掉，不要让它在弹层里横着长出去
+    let painter = ui.painter().with_clip_rect(rect.shrink2(Vec2::new(6.0, 0.0)));
+    painter.text(
+        rect.left_top() + Vec2::new(8.0, 4.0),
+        egui::Align2::LEFT_TOP,
+        &h.name,
+        egui::FontId::proportional(12.5),
+        theme::TEXT,
+    );
+    painter.text(
+        rect.left_top() + Vec2::new(8.0, 21.0),
+        egui::Align2::LEFT_TOP,
+        &h.folder,
+        egui::FontId::proportional(11.0),
+        theme::FAINT,
+    );
+    resp.on_hover_text(format!("{}
+{}", h.name, h.folder)).clicked()
+}
 
 /// 解码图片。GIF 会把所有帧都解出来（有动画才多帧），其余格式只解一帧。
 fn decode_image(bytes: &[u8]) -> Result<super::DecodedImage, String> {

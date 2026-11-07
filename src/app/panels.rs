@@ -99,6 +99,7 @@ impl App {
                                                     // 内容变了，编辑器重新加载
                                                     self.editor = None;
                                                     self.need_list = true;
+                                                    self.invalidate_duplicates();
                                                 }
                                                 Err(err) => self.notify(format!("恢复失败：{err}")),
                                             }

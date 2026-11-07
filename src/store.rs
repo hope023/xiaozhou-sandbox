@@ -50,6 +50,11 @@ pub struct Version {
     pub created_at: i64,
     #[serde(default)]
     pub pinned: bool,
+    /// 明文内容的 SHA-256（十六进制）。入库时顺路算好，查重直接比它，
+    /// 不用再解密整份文件——大文件也能瞬时判断。
+    /// 旧库里的版本没有这个字段，第一次查到时补算并写回。
+    #[serde(default)]
+    pub hash: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -222,28 +227,35 @@ impl Vault {
         blob::decrypt_range(&self.dek[..], &p, entry_id, start, end)
     }
 
-    fn put_blob_file(&self, file_id: [u8; 16], entry_id: &str, src: &Path) -> Result<(String, u64)> {
+    /// 返回 (blob id, 明文大小, 明文指纹)。
+    fn put_blob_file(
+        &self,
+        file_id: [u8; 16],
+        entry_id: &str,
+        src: &Path,
+    ) -> Result<(String, u64, String)> {
         let blob_id = uuid::Uuid::new_v4().simple().to_string();
         let dst = self.blob_path(&blob_id);
         fs::create_dir_all(dst.parent().unwrap())?;
         let tmp = dst.with_extension("tmp");
-        let size = blob::encrypt_file(&self.dek[..], file_id, entry_id, src, &tmp)?;
+        let (size, digest) = blob::encrypt_file(&self.dek[..], file_id, entry_id, src, &tmp)?;
         fs::rename(&tmp, &dst)?;
-        Ok((blob_id, size))
+        Ok((blob_id, size, crypto::hex(&digest)))
     }
 
+    /// 返回 (blob id, 明文大小, 明文指纹)。
     fn put_blob_bytes(
         &self,
         file_id: [u8; 16],
         entry_id: &str,
         plain: &[u8],
-    ) -> Result<(String, u64)> {
+    ) -> Result<(String, u64, String)> {
         let blob_id = uuid::Uuid::new_v4().simple().to_string();
         let dst = self.blob_path(&blob_id);
         fs::create_dir_all(dst.parent().unwrap())?;
         let ct = blob::encrypt_bytes(&self.dek[..], file_id, entry_id, plain)?;
         atomic_write(&dst, &ct)?;
-        Ok((blob_id, plain.len() as u64))
+        Ok((blob_id, plain.len() as u64, crypto::sha256_hex(plain)))
     }
 
     pub fn remove_blob(&self, blob_id: &str) {
@@ -254,7 +266,7 @@ impl Vault {
     pub fn import_file(&mut self, parent: &str, name: &str, src: &Path) -> Result<Entry> {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let fid = crypto::random_16();
-        let (blob_id, size) = self.put_blob_file(fid, &id, src)?;
+        let (blob_id, size, hash) = self.put_blob_file(fid, &id, src)?;
         let ts = now_ts();
         let ver = Version {
             id: uuid::Uuid::new_v4().simple().to_string(),
@@ -262,6 +274,7 @@ impl Vault {
             size,
             created_at: ts,
             pinned: false,
+            hash,
         };
         let entry = Entry {
             id: id.clone(),
@@ -280,7 +293,13 @@ impl Vault {
         Ok(entry)
     }
 
-    pub fn add_version(&mut self, entry_id: &str, blob_id: String, size: u64) -> Result<()> {
+    pub fn add_version(
+        &mut self,
+        entry_id: &str,
+        blob_id: String,
+        size: u64,
+        hash: String,
+    ) -> Result<()> {
         let ts = now_ts();
         let settings = self.index.settings.clone();
         let entry = self.index.entries.get_mut(entry_id).ok_or(Error::NotFound)?;
@@ -290,6 +309,7 @@ impl Vault {
             size,
             created_at: ts,
             pinned: false,
+            hash,
         };
         entry.versions.push(ver.clone());
         entry.current = Some(ver.id);
@@ -301,8 +321,8 @@ impl Vault {
 
     pub fn save_text(&mut self, entry_id: &str, content: &str) -> Result<Entry> {
         let fid = crypto::random_16();
-        let (blob_id, size) = self.put_blob_bytes(fid, entry_id, content.as_bytes())?;
-        self.add_version(entry_id, blob_id, size)?;
+        let (blob_id, size, hash) = self.put_blob_bytes(fid, entry_id, content.as_bytes())?;
+        self.add_version(entry_id, blob_id, size, hash)?;
         self.save_index()?;
         self.index.entries.get(entry_id).cloned().ok_or(Error::NotFound)
     }
@@ -464,14 +484,24 @@ impl Vault {
     }
 
     pub fn restore_version(&mut self, entry_id: &str, version_id: &str) -> Result<Entry> {
-        let (blob_id, size) = {
+        let (blob_id, size, hash) = {
             let e = self.index.entries.get(entry_id).ok_or(Error::NotFound)?;
             let v = e.versions.iter().find(|v| v.id == version_id).ok_or(Error::NotFound)?;
-            (v.blob.clone(), v.size)
+            (v.blob.clone(), v.size, v.hash.clone())
         };
-        self.add_version(entry_id, blob_id, size)?;
+        self.add_version(entry_id, blob_id, size, hash)?;
         self.save_index()?;
         self.index.entries.get(entry_id).cloned().ok_or(Error::NotFound)
+    }
+
+    /// 给旧版本补上内容指纹。旧库（本字段出现之前写的）第一次被查到时
+    /// 现算一次，写回索引，之后就只剩一次哈希比较。调用方负责存索引。
+    pub fn fill_version_hash(&mut self, entry_id: &str, version_id: &str, hash: &str) {
+        if let Some(e) = self.index.entries.get_mut(entry_id) {
+            if let Some(v) = e.versions.iter_mut().find(|v| v.id == version_id) {
+                v.hash = hash.to_string();
+            }
+        }
     }
 
     pub fn pin_version(&mut self, entry_id: &str, version_id: &str, pinned: bool) -> Result<()> {

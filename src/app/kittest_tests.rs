@@ -8,7 +8,7 @@ use eframe::egui;
 use egui_kittest::{kittest::By, kittest::Queryable, Harness};
 
 use super::theme;
-use super::App;
+use super::{App, EditorState};
 use crate::service;
 use crate::state::{AppState, Config};
 use crate::{store, vault};
@@ -430,4 +430,201 @@ fn kittest_rename_accepts_chinese() {
         draft.contains("季度报告"),
         "中文应能进入改名框，实际：{draft:?}"
     );
+}
+
+/// 回归：**文件夹**改名同样要吃中文。
+///
+/// 文件夹走的是检查器里另一条分支（`kind == "dir"`），而且它下面没有文本
+/// 编辑器——隐私输入若还开着，`privacy_on` 会挂着每帧把系统输入法摁成英文，
+/// 表现就是文件能改名、文件夹改名打不进中文。
+#[test]
+fn kittest_rename_folder_accepts_chinese() {
+    let dir = setup_vault("renamefoldercn");
+    let (mut harness, state) = make_app(dir);
+
+    harness.run_steps(3);
+    harness
+        .get(By::new().role(egui::accesskit::Role::PasswordInput))
+        .type_text(PW);
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(10);
+
+    let folder = service::create_folder(&state, "root", "归档").unwrap();
+    harness.state_mut().selected = Some(folder.clone());
+    harness.run_steps(2);
+    harness.state_mut().begin_rename("归档");
+    harness.run_steps(2);
+    assert!(harness.state().renaming, "文件夹应进入改名状态");
+
+    // 改名框不该逐帧打断输入法组合
+    let interrupted = harness
+        .output()
+        .platform_output
+        .ime
+        .as_ref()
+        .is_some_and(|i| i.should_interrupt_composition);
+    assert!(!interrupted, "文件夹改名框不该逐帧打断输入法组合");
+
+    // 输入法上屏 + 回车提交，整条链路走通
+    harness.input_mut().events.push(egui::Event::Ime(
+        egui::ImeEvent::Commit("季度资料".into()),
+    ));
+    harness.run_steps(2);
+    assert!(
+        harness.state().rename_draft.contains("季度资料"),
+        "中文应能进入文件夹改名框，实际：{:?}",
+        harness.state().rename_draft
+    );
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(3);
+
+    let names: Vec<String> = service::list_dir(&state, "root")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("季度资料")),
+        "改好的中文文件夹名应落库，实际：{names:?}"
+    );
+}
+
+/// 打开一个文件后，右上角要能看出这份内容在库里还有没有副本、在哪里。
+#[test]
+fn kittest_duplicate_badge() {
+    let dir = setup_vault("dupb");
+    // 再放一份内容完全相同、名字和目录都不同的副本
+    {
+        let dek = vault::unlock(&dir, PW).unwrap();
+        let mut v = store::Vault::open(dir.clone(), dek).unwrap();
+        let folder = v.create_folder("root", "归档").unwrap();
+        let src = dir.join("_dup.txt");
+        std::fs::write(&src, "hello test").unwrap();
+        v.import_file(&folder.id, "副本.txt", &src).unwrap();
+        v.save_index().unwrap();
+    }
+
+    let (mut harness, _state) = make_app(dir);
+    harness.run_steps(3);
+    harness
+        .get(By::new().role(egui::accesskit::Role::PasswordInput))
+        .type_text(PW);
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(10);
+
+    harness.get(By::new().label("hello.txt")).click();
+    harness.run_steps(2);
+
+    // 查重在后台线程跑，等结论回来（最多 ~3 秒）
+    for _ in 0..100 {
+        let done = {
+            let app = harness.state();
+            !app.dup.pending && app.dup.for_id != ""
+        };
+        if done {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        harness.run_steps(1);
+    }
+
+    {
+        let app = harness.state();
+        assert!(!app.dup.pending, "查重应该已经出结果");
+        assert_eq!(app.dup.hits.len(), 1, "应找到一份副本：{:?}", app.dup.hits);
+        assert_eq!(app.dup.hits[0].folder, "全部文件 / 归档");
+        assert_eq!(app.dup.hits[0].name, "副本.txt");
+    }
+
+    // 角标文案要出现在界面里
+    harness.get(By::new().label_contains("另有 1 份"));
+}
+
+/// 回归：编辑器消失后隐私模式必须自动退出。
+///
+/// 隐私输入只在文本编辑器里存在。删文件 / 条目从列表里消失时旧代码只把
+/// `editor` 清掉、`privacy_on` 留着，于是 `keep_ime_off` 每帧把窗口输入法
+/// 摁成英文——全应用的输入框（最典型的就是改名框）从此打不进中文，
+/// 英文却正常，很难联想到是隐私模式没退。
+#[test]
+fn kittest_privacy_exits_when_editor_vanishes() {
+    let dir = setup_vault("privacyexit");
+    let (mut harness, _state) = make_app(dir);
+
+    harness.run_steps(2);
+    harness
+        .get(By::new().role(egui::accesskit::Role::PasswordInput))
+        .type_text(PW);
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(10);
+
+    harness.get(By::new().label("hello.txt")).click();
+    harness.run_steps(2);
+    harness.state_mut().set_privacy_mode(true);
+    harness.run_steps(2);
+    assert!(harness.state().privacy_on, "隐私模式应已开启");
+
+    // 模拟「选中的条目消失了」：编辑器与选中项一起被清掉（见 refresh_list）
+    harness.state_mut().selected = None;
+    harness.state_mut().editor = None;
+    harness.run_steps(2);
+
+    assert!(
+        !harness.state().privacy_on,
+        "编辑器没了必须退出隐私模式，否则系统输入法会一直停在英文"
+    );
+}
+
+/// 页签：打开多个条目、切回来保留各自状态、关掉时按顺序接上。
+#[test]
+fn tabs_keep_their_own_state() {
+    let dir = setup_vault("tabs");
+    let state = Arc::new(AppState::default());
+    *state.config.lock().unwrap() = Config {
+        vault_path: dir.display().to_string(),
+        ..Default::default()
+    };
+    service::open_vault_at(&state, &dir.display().to_string()).unwrap();
+    service::unlock(&state, PW).unwrap();
+
+    // 再塞一个文件，凑够两个页签（必须放在库目录之外，否则会被导入逻辑跳过）
+    let src2 = std::env::temp_dir().join("xv-kittest-tabs-src2.txt");
+    std::fs::write(&src2, "second").unwrap();
+    service::import_paths(&state, &[src2.display().to_string()], "root").unwrap();
+
+    let mut app = App::new(Arc::clone(&state), egui::Context::default());
+    let entries = service::list_dir(&state, "root").unwrap();
+    assert_eq!(entries.len(), 2);
+
+    app.select(Some(entries[0].clone()));
+    // 页签自己的编辑器状态：切走再切回来要还在
+    app.editor = Some(EditorState {
+        entry_id: entries[0].id.clone(),
+        text: "草稿".into(),
+        dirty: false,
+        last_edit: None,
+        truncated: false,
+        phase: "已加密写入",
+    });
+
+    app.select(Some(entries[1].clone()));
+    assert_eq!(app.tabs.len(), 2, "两个文件应该开两个页签");
+    assert_eq!(app.active, 1);
+    assert!(app.editor.is_none(), "切走之后不该把上一个页签的编辑器带过来");
+
+    // 重复打开同一个文件只切过去，不再开新页签
+    app.select(Some(entries[0].clone()));
+    assert_eq!(app.tabs.len(), 2);
+    assert_eq!(app.active, 0);
+    assert_eq!(app.editor.as_ref().unwrap().text, "草稿", "切回来要恢复编辑器状态");
+
+    // 关掉当前页签，剩下的那个接上
+    app.close_tab(0);
+    assert_eq!(app.tabs.len(), 1);
+    assert_eq!(app.selected.as_ref().unwrap().id, entries[1].id);
+
+    // 全关掉就回到空状态
+    app.close_tab(0);
+    assert!(app.tabs.is_empty());
+    assert!(app.selected.is_none());
 }

@@ -125,6 +125,41 @@ pub fn keep_ime_off(hwnd: isize) {
     }
 }
 
+/// 把系统输入法**还回来**：被解绑过就重建上下文，被摁成英文就打开。
+///
+/// 这是给「需要中文的系统输入框」准备的（检查器里的改名框就是）：
+/// 隐私输入如果因为任何原因没能成对恢复（锁库、条目被删、状态残留），
+/// 窗口会一直处于「上下文解绑 / 输入法关闭」的状态——症状是英文能打、
+/// 拼音打不进去。改名之前先走一遍这里，把主动权拿回来。
+///
+/// 返回是否确认「此刻可以用系统输入法打中文」。非 Windows 上恒为 false。
+pub fn ensure_ime_available(hwnd: isize) -> bool {
+    #[cfg(windows)]
+    {
+        if hwnd == 0 {
+            return false;
+        }
+        let ptr = hwnd as *mut std::ffi::c_void;
+        unsafe {
+            // 1) 读不到上下文 = 还挂着隐私输入的解绑状态，先按系统默认重建
+            if imp::open_status(ptr).is_none() && imp::apply(ptr, false) == 0 {
+                return false;
+            }
+            // 2) 重建后仍然拿不到 = 系统不接受，别再假装成功
+            match imp::open_status(ptr) {
+                Some(true) => true,
+                Some(false) => imp::set_open_status(ptr, true),
+                None => false,
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        false
+    }
+}
+
 /// 打开/关闭隐私输入时调用。`on = true` 压制输入法，`false` 恢复系统默认。
 /// `hwnd` 为主窗口句柄（egui 侧从 `Frame::window_handle` 取得）。
 pub fn set_isolated(hwnd: isize, on: bool) -> crate::error::Result<()> {

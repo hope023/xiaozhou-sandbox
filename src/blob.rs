@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::crypto;
@@ -134,13 +135,16 @@ fn read_up_to(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
 }
 
 /// 流式加密：不把整个文件读进内存。新写入一律使用 v2 格式。
+///
+/// 返回 (明文长度, 明文 SHA-256)。指纹是顺路算的——明文反正已经过手，
+/// 不额外读盘，却能让查重跳过「再解密一遍」。
 pub fn encrypt_file(
     dek: &[u8],
     file_id: [u8; 16],
     entry_id: &str,
     src: &Path,
     dst: &Path,
-) -> Result<u64> {
+) -> Result<(u64, [u8; 32])> {
     let plain_len = std::fs::metadata(src)?.len();
     let header = Header {
         version: FMT_V2,
@@ -158,9 +162,17 @@ pub fn encrypt_file(
     fout.write_all(&hb)?;
 
     let mut buf = vec![0u8; CHUNK];
+    let mut hasher = Sha256::new();
     let mut idx: u64 = 0;
     loop {
         let n = read_up_to(&mut fin, &mut buf)?;
+        // 文件大小恰好是整块时，这一轮读到 0 字节，不能再写一个空块：
+        // 头部只声明了 plain_len 那么多块，多出的 16 字节 TAG 会让
+        // open_and_check 的长度校验对不上，整份文件都读不出来。
+        if n == 0 && idx > 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
         let nonce = nonce_for(&header.nonce_prefix, idx);
         let aad = aad_for(&hb, idx, owner);
         let ct = crypto::aead_encrypt(&key[..], &nonce, &aad, &buf[..n])?;
@@ -171,7 +183,7 @@ pub fn encrypt_file(
         }
     }
     fout.sync_all()?;
-    Ok(plain_len)
+    Ok((plain_len, hasher.finalize().into()))
 }
 
 pub fn encrypt_bytes(
@@ -220,7 +232,13 @@ fn open_and_check(path: &Path) -> Result<(File, Header)> {
     let expect = header.chunk_offset(header.last_chunk_index())
         + header.chunk_ct_len(header.last_chunk_index()) as u64;
     let actual = f.metadata()?.len();
-    if actual != expect {
+    // 兼容旧库：早期版本在「大小刚好是 chunk_size 整数倍」时会多写一个空的尾块
+    // （只剩 16 字节 TAG）。这些文件必须还能打开，所以只容忍这一种多出来的情况，
+    // 读取时也永远不会碰到那一块（块数由 plain_len 决定）。
+    let legacy_tail = header.plain_len > 0
+        && header.plain_len % header.chunk_size as u64 == 0
+        && actual == expect + TAG as u64;
+    if actual != expect && !legacy_tail {
         return Err(Error::Corrupt);
     }
     Ok((f, header))

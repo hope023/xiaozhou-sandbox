@@ -546,4 +546,119 @@ mod tests {
         let by_name = idx.query("b.md", 10);
         assert!(by_name.iter().any(|h| h.name == "b.md"));
     }
+
+    /// 回归：文件大小恰好是 1 MiB 整数倍时，密文不该多写一个空尾块。
+    /// 早期版本会多出 16 字节 TAG，导致长度校验失败、整份文件读不出来。
+    #[test]
+    fn exact_chunk_multiple_roundtrips() {
+        let dir = tmp("exact");
+        vault::create(&dir, "pw12345678", None).unwrap();
+        let dek = vault::unlock(&dir, "pw12345678").unwrap();
+        let mut v = store::Vault::open(dir.clone(), dek).unwrap();
+
+        for kib in [1024usize, 2048, 4096] {
+            let data: Vec<u8> = (0..kib * 1024).map(|i| (i % 251) as u8).collect();
+            let name = format!("exact-{kib}k.bin");
+            let p = dir.join(&name);
+            std::fs::write(&p, &data).unwrap();
+            let e = v.import_file("root", &name, &p).unwrap();
+            let got = v.read_blob(&e.id, &e.versions[0].blob).unwrap();
+            assert_eq!(got.as_slice(), &data[..], "{name} 读回来不一致");
+            // 分块读也要能读到最后一块
+            let s = data.len() as u64 - 100;
+            let tail = v.read_blob_range(&e.id, &e.versions[0].blob, s, data.len() as u64).unwrap();
+            assert_eq!(tail.as_slice(), &data[data.len() - 100..]);
+        }
+    }
+
+    /// 查重：比的是内容，不是名字。
+    /// 同内容不同名/不同目录要算重复；同大小不同内容不能算。
+    /// 跨分块的大文件也要能走完（>1 MiB 时才会经过分块解密路径）。
+    #[test]
+    fn duplicates_match_by_content_not_name() {
+        let dir = tmp("dup");
+        vault::create(&dir, "pw12345678", None).unwrap();
+        let dek = vault::unlock(&dir, "pw12345678").unwrap();
+        let mut v = store::Vault::open(dir.clone(), dek).unwrap();
+
+        let folder = v.create_folder("root", "归档").unwrap();
+        let src_a = dir.join("a.txt");
+        let src_b = dir.join("b.txt");
+        std::fs::write(&src_a, b"hello world!").unwrap();
+        // 同样是 12 字节，内容不同：只比大小的实现会误报
+        std::fs::write(&src_b, b"hello world?").unwrap();
+
+        let a = v.import_file("root", "报告.txt", &src_a).unwrap();
+        let b = v.import_file("root", "别的.txt", &src_b).unwrap();
+        let c = v.import_file(&folder.id, "副本.md", &src_a).unwrap();
+
+        // 跨分块的大文件：3.5 MiB，两份同内容 + 一份只差一个字节
+        let big: Vec<u8> = (0..(3 * 1024 * 1024 + 512 * 1024))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let big_src = dir.join("big.bin");
+        std::fs::write(&big_src, &big).unwrap();
+        let mut other = big.clone();
+        other[2_000_000] ^= 0xFF;
+        let other_src = dir.join("other.bin");
+        std::fs::write(&other_src, &other).unwrap();
+        let big_a = v.import_file("root", "大文件.bin", &big_src).unwrap();
+        let big_b = v.import_file(&folder.id, "大文件副本.bin", &big_src).unwrap();
+        let big_c = v.import_file("root", "只是同大小.bin", &other_src).unwrap();
+
+        // 超过 16 MiB：新入库的版本自带指纹，查重不用解密也能判出来
+        let huge: Vec<u8> = (0..(18 * 1024 * 1024)).map(|i| (i % 241) as u8).collect();
+        let huge_src = dir.join("huge.bin");
+        std::fs::write(&huge_src, &huge).unwrap();
+        let huge_a = v.import_file("root", "大视频.bin", &huge_src).unwrap();
+        let huge_b = v.import_file(&folder.id, "大视频副本.bin", &huge_src).unwrap();
+
+        // 旧库：抹掉一份的指纹，模拟升级前写入的版本
+        v.index.entries.get_mut(&c.id).unwrap().versions[0].hash.clear();
+
+        v.save_index().unwrap();
+
+        let state = std::sync::Arc::new(state::AppState::default());
+        service::open_vault_at(&state, &dir.display().to_string()).unwrap();
+        service::unlock(&state, "pw12345678").unwrap();
+
+        let hits = service::find_duplicates(&state, &a.id).unwrap().hits;
+        assert_eq!(hits.len(), 1, "应该只找到子目录里那一份");
+        assert_eq!(hits[0].id, c.id);
+        assert_eq!(hits[0].folder, "全部文件 / 归档", "要能说清在哪里");
+        assert_eq!(hits[0].name, "副本.md");
+
+        // 反向也要成立
+        let back = service::find_duplicates(&state, &c.id).unwrap().hits;
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].id, a.id);
+
+        // 旧版本没有指纹：现算一次也要能比出来，并把指纹写回索引
+        let filled = state
+            .read(|v| Ok(v.index.entries.get(&c.id).unwrap().versions[0].hash.clone()))
+            .unwrap();
+        assert_eq!(filled.len(), 64, "查过一次后旧版本应当补上指纹");
+
+        // 大文件：靠指纹直接比，不解密、也不该被 16 MiB 上限挡掉
+        let hh = service::find_duplicates(&state, &huge_a.id).unwrap();
+        assert!(hh.skipped_size.is_none(), "有指纹的大文件不该被跳过");
+        assert_eq!(hh.hits.len(), 1, "18 MiB 的两份应当比出重复");
+        assert_eq!(hh.hits[0].id, huge_b.id);
+
+        // 同大小不同内容：不能算重复
+        assert!(service::find_duplicates(&state, &b.id).unwrap().hits.is_empty());
+
+        // 大文件（跨分块解密）
+        let bh = service::find_duplicates(&state, &big_a.id).unwrap().hits;
+        assert_eq!(bh.len(), 1, "3.5 MiB 的两份应当比出重复，实际 {:?}", bh);
+        assert_eq!(bh[0].id, big_b.id);
+        assert!(
+            service::find_duplicates(&state, &big_c.id).unwrap().hits.is_empty(),
+            "只差一个字节不能算重复"
+        );
+
+        // 副本进了回收站就不再算（库里的「还在」只指看得见的）
+        service::delete_entry(&state, &c.id).unwrap();
+        assert!(service::find_duplicates(&state, &a.id).unwrap().hits.is_empty());
+    }
 }

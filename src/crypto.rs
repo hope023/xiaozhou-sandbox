@@ -78,3 +78,22 @@ pub fn subkey(master: &[u8], salt: &[u8], info: &[u8]) -> Zeroizing<[u8; KEY_LEN
     hk.expand(info, &mut okm[..]).expect("hkdf expand");
     okm
 }
+
+/// 小写十六进制。
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+/// 明文的内容指纹（SHA-256，十六进制）。
+///
+/// 入库时顺手算：反正整份明文本来就要过一遍加密，多喂一个哈希器
+/// 只多几个百分点，换来的是查重不必再解密——几 GB 的视频也能秒判。
+pub fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest;
+    hex(&Sha256::digest(data))
+}

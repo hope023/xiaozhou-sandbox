@@ -864,6 +864,219 @@ pub fn locate_entry(state: &AppState, id: &str) -> Result<Locate> {
     })
 }
 
+// ─────────────────────────── 内容查重 ───────────────────────────
+
+/// 一处「内容相同」的副本（回收站里的不算）。
+#[derive(Serialize, Clone, Debug)]
+pub struct DuplicateHit {
+    pub id: String,
+    pub name: String,
+    /// 所在目录，根目录显示为「全部文件」（与面包屑一致）
+    pub folder: String,
+    pub size: u64,
+    pub modified_at: i64,
+}
+
+/// 解密比对的窗口大小。密文按条目派生密钥、每条随机 nonce，
+/// 同样内容的两份文件密文毫无相似之处，只能解密后比明文。
+const HASH_WINDOW: u64 = 4 * 1024 * 1024;
+
+/// 流式算一个版本明文的 SHA-256（十六进制），内存占用与文件大小无关。
+/// 只给旧库补指纹用——新文件在加密时就算好了。
+fn sha_of_entry(state: &AppState, entry_id: &str, blob: &str, size: u64) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut pos = 0u64;
+    while pos < size {
+        let end = (pos + HASH_WINDOW).min(size);
+        // 每次只拿 4 MiB：把锁让出去，自动保存、视频播放不会被一次查重卡住
+        let buf = state.read(|v| v.read_blob_range(entry_id, blob, pos, end))?;
+        if buf.is_empty() {
+            return Err(Error::Corrupt);
+        }
+        h.update(&buf[..]);
+        pos = end;
+    }
+    Ok(crate::crypto::hex(&h.finalize()))
+}
+
+/// 目录全路径，只用来在提示里说「在哪里」。
+fn folder_label(v: &Vault, parent: &str) -> String {
+    let mut names: Vec<String> = Vec::new();
+    let mut cur = parent.to_string();
+    for _ in 0..64 {
+        if cur == "root" || cur.is_empty() {
+            break;
+        }
+        let Some(p) = v.index.entries.get(&cur) else { break };
+        names.push(p.name.clone());
+        cur = p.parent.clone();
+    }
+    names.reverse();
+    if names.is_empty() {
+        "全部文件".into()
+    } else {
+        format!("全部文件 / {}", names.join(" / "))
+    }
+}
+
+/// 查重的一次结果。
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct DupReport {
+    pub hits: Vec<DuplicateHit>,
+    /// 文件超过 `DUP_MAX_BYTES`，没有做内容比对（原值，用来说明为什么没查）
+    pub skipped_size: Option<u64>,
+    /// 没比成的同大小候选份数：旧库里没指纹的超大文件，或一次要现算的份数超限
+    pub truncated: usize,
+}
+
+/// 现算指纹的大小上限。
+///
+/// 新入库的文件在加密时就把指纹算好了，多大都能查——几 GB 的视频也是瞬间。
+/// 这个上限只约束**旧库**里没有指纹的文件：现算要把整份明文解出来再哈希，
+/// 实测（release，本机 SSD）约 3.8 ms/MB，8 MB 的照片 30 ms 无感，
+/// 2 GB 的视频却是十几秒起步。所以超限就不现算，角标上老实说「未查重」。
+pub const DUP_MAX_BYTES: u64 = 16 << 20;
+
+/// 一次查重里最多给几个旧文件现算指纹。
+/// 旧库升级后第一次打开某个文件时最多补算这么多，其余的等下次。
+pub const DUP_MAX_CANDIDATES: usize = 6;
+
+/// 查重用的只读快照：一个文件的当前版本，不含明文。
+struct DupCand {
+    id: String,
+    name: String,
+    parent: String,
+    size: u64,
+    version_id: String,
+    blob: String,
+    hash: String,
+    modified_at: i64,
+}
+
+impl DupCand {
+    fn of(e: &Entry) -> Option<DupCand> {
+        let v = e.current_version()?;
+        Some(DupCand {
+            id: e.id.clone(),
+            name: e.name.clone(),
+            parent: e.parent.clone(),
+            size: v.size,
+            version_id: v.id.clone(),
+            blob: v.blob.clone(),
+            hash: v.hash.clone(),
+            modified_at: e.modified_at,
+        })
+    }
+}
+
+/// 找出与 `id` 内容完全相同的其他文件。
+///
+/// 比的是入库时顺手算好的明文指纹，不再解密候选——库里有一万个文件、
+/// 或者候选是几个 GB 的视频，都只是一次字符串比较。
+/// 只有旧库（版本上没有指纹）才退回「解密 + 现算」，且限量、结果写回索引。
+pub fn find_duplicates(state: &AppState, id: &str) -> Result<DupReport> {
+    // 1) 只读快照：目标 + 所有未删除的同大小文件。只碰索引，不解密任何东西。
+    let (target, cands) = state.read(|v| {
+        let target = match v.index.entries.get(id) {
+            Some(e) if e.kind == "file" && e.deleted_at.is_none() => DupCand::of(e),
+            _ => None,
+        };
+        let Some(target) = target else {
+            return Ok((None, Vec::new()));
+        };
+        let cands: Vec<DupCand> = v
+            .index
+            .entries
+            .values()
+            .filter(|c| c.kind == "file" && c.deleted_at.is_none() && c.id != target.id)
+            .filter_map(DupCand::of)
+            // 先按大小筛：指纹相同必然同大小，这一步只是让旧文件少算几次
+            .filter(|c| c.size == target.size)
+            .collect();
+        Ok((Some(target), cands))
+    })?;
+    let Some(target) = target else {
+        return Ok(DupReport::default());
+    };
+
+    // 2) 目标指纹：入库时算过就直接用，旧文件现算（太大就不查）
+    let mut backfill: Vec<(String, String, String)> = Vec::new();
+    let want = if !target.hash.is_empty() {
+        target.hash.clone()
+    } else {
+        if target.size > DUP_MAX_BYTES {
+            return Ok(DupReport { skipped_size: Some(target.size), ..Default::default() });
+        }
+        let h = sha_of_entry(state, &target.id, &target.blob, target.size)?;
+        backfill.push((target.id.clone(), target.version_id.clone(), h.clone()));
+        h
+    };
+
+    // 3) 逐个候选比指纹
+    let mut same: Vec<DupCand> = Vec::new();
+    let mut truncated = 0usize;
+    let mut computed = 0usize;
+    for c in cands {
+        let h = if !c.hash.is_empty() {
+            c.hash.clone()
+        } else if c.size > DUP_MAX_BYTES || computed >= DUP_MAX_CANDIDATES {
+            // 旧文件，又太大或已经补算够多：这次不比，如实报个数
+            truncated += 1;
+            continue;
+        } else {
+            computed += 1;
+            match sha_of_entry(state, &c.id, &c.blob, c.size) {
+                Ok(h) => {
+                    backfill.push((c.id.clone(), c.version_id.clone(), h.clone()));
+                    h
+                }
+                // 单个候选解不开（文件被外部动过）不该让整次查重失败
+                Err(_) => {
+                    truncated += 1;
+                    continue;
+                }
+            }
+        };
+        if h == want {
+            same.push(c);
+        }
+    }
+
+    // 4) 补算出来的指纹写回索引：同一个文件下次查就只剩比较。
+    //    一次最多补 7 条，写索引是一次性的；失败也不影响这次的结论。
+    if !backfill.is_empty() {
+        let _ = state.write(|v| {
+            for (eid, vid, h) in &backfill {
+                v.fill_version_hash(eid, vid, h);
+            }
+            v.save_index()
+        });
+    }
+
+    if same.is_empty() {
+        return Ok(DupReport { truncated, ..Default::default() });
+    }
+
+    // 5) 补上「在哪里」，按目录排一下，弹层里读起来顺
+    let hits = state.read(|v| {
+        let mut hits: Vec<DuplicateHit> = same
+            .iter()
+            .map(|c| DuplicateHit {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                folder: folder_label(v, &c.parent),
+                size: c.size,
+                modified_at: c.modified_at,
+            })
+            .collect();
+        hits.sort_by(|a, b| a.folder.cmp(&b.folder).then_with(|| a.name.cmp(&b.name)));
+        Ok(hits)
+    })?;
+
+    Ok(DupReport { hits, skipped_size: None, truncated })
+}
+
 // ─────────────────────── 隐私输入的 IME 解绑 ───────────────────────
 
 /// 进入隐私输入时解绑系统输入法，退出时恢复。
@@ -876,4 +1089,10 @@ pub fn set_ime_isolated(hwnd: isize, on: bool) -> bool {
         return false;
     }
     true
+}
+
+/// 把系统输入法还回来（解绑过就重建、关闭着就打开）。
+/// 给需要中文的系统输入框用，例如检查器里的改名框。
+pub fn ensure_ime_available(hwnd: isize) -> bool {
+    crate::ime::ensure_ime_available(hwnd)
 }

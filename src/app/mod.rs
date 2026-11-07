@@ -120,6 +120,31 @@ impl Default for VideoState {
     }
 }
 
+impl Default for ImageState {
+    fn default() -> Self {
+        Self {
+            for_id: String::new(),
+            rx: None,
+            texture: None,
+            frames: Vec::new(),
+            frame_idx: 0,
+            frame_at: std::time::Instant::now(),
+        }
+    }
+}
+
+/// 一个打开着的页签。
+///
+/// 检查器一次只画一个，但每个页签各自带着编辑器/图片/视频/查重的状态：
+/// 切回来接着看，不用重新解密；切走时视频暂停，不会在后台继续出声。
+pub struct Tab {
+    pub entry: EntryView,
+    pub editor: Option<EditorState>,
+    pub image: ImageState,
+    pub video: VideoState,
+    pub dup: DupState,
+}
+
 pub struct SearchUi {
     pub q: String,
     pub typed_at: Option<Instant>,
@@ -127,6 +152,25 @@ pub struct SearchUi {
     pub report: SearchReport,
     /// 刚打开面板，下一帧把焦点交给搜索框（只抢一次，见 panels.rs）。
     pub focus_pending: bool,
+}
+
+/// 检查器右上角的查重结果。
+///
+/// 查重要解密候选文件的明文（密文按条目派生密钥，比不了密文），
+/// 所以放到后台线程算，UI 只读结论；这里记着「结论属于哪个条目」，
+/// 换选中时才知道该不该重算。
+#[derive(Default)]
+pub struct DupState {
+    /// 结论（或正在算的）对应的条目 id
+    pub for_id: String,
+    /// 后台线程还在算
+    pub pending: bool,
+    pub hits: Vec<crate::service::DuplicateHit>,
+    pub error: Option<String>,
+    /// 文件太大，压根没做内容比对（存原大小，用来说清为什么）
+    pub skipped_size: Option<u64>,
+    /// 同大小候选太多，没比完的份数
+    pub truncated: usize,
 }
 
 pub struct App {
@@ -164,6 +208,14 @@ pub struct App {
     pub image: ImageState,
     pub video: VideoState,
     pub search: SearchUi,
+
+    /// 打开着的页签（含当前激活的那个）+ 激活下标
+    pub tabs: Vec<Tab>,
+    pub active: usize,
+
+    /// 查重结论 + 后台线程回执（`None` = 没有在算）
+    pub dup: DupState,
+    pub dup_rx: Option<Receiver<(String, std::result::Result<service::DupReport, String>)>>,
 
     /// 隐私输入模式（编辑器内切换）。
     pub privacy_on: bool,
@@ -237,14 +289,7 @@ impl App {
             versions: Vec::new(),
             versions_for: String::new(),
             editor: None,
-            image: ImageState {
-                for_id: String::new(),
-                rx: None,
-                texture: None,
-                frames: Vec::new(),
-                frame_idx: 0,
-                frame_at: std::time::Instant::now(),
-            },
+            image: ImageState::default(),
             video: VideoState::default(),
             search: SearchUi {
                 q: String::new(),
@@ -257,6 +302,10 @@ impl App {
             privacy: privacy::PrivacyState::default(),
             ime_detach_ok: None,
             was_window_focused: false,
+            tabs: Vec::new(),
+            active: 0,
+            dup: DupState::default(),
+            dup_rx: None,
             #[cfg(debug_assertions)]
             e2e_frame: 0,
             #[cfg(debug_assertions)]
@@ -288,30 +337,144 @@ impl App {
         self.toast = Some(Toast::new(text));
     }
 
-    /// 选中条目（切换时先把旧编辑器的未保存内容落盘）。
+    /// 选中条目：文件/文件夹都开成一个页签，已经开着就切过去。
+    ///
+    /// `None` 表示「列表里没有选中项」——**不动页签**。浏览别的目录、
+    /// 点侧栏分类都不该把正在看的东西关掉。
     pub fn select(&mut self, e: Option<EntryView>) {
-        if let Some(ed) = &self.editor {
-            let switching = match &e {
-                Some(n) => n.id != ed.entry_id,
-                None => true,
-            };
-            if switching && ed.dirty {
-                self.flush_editor();
-            }
+        let Some(e) = e else { return };
+        // 切页签前先把当前编辑器里没保存的内容落盘
+        if self.editor.as_ref().is_some_and(|ed| ed.dirty) {
+            self.flush_editor();
         }
-        if self.editor.as_ref().is_some_and(|ed| {
-            !e.as_ref().is_some_and(|n| n.id == ed.entry_id)
-        }) {
-            // 换文件了：编辑器缓存作废，隐私输入也要退出
-            if self.privacy_on {
-                self.exit_privacy_mode();
+        if let Some(i) = self.tabs.iter().position(|t| t.entry.id == e.id) {
+            self.activate_tab(i);
+            if let Some(t) = self.tabs.get_mut(i) {
+                t.entry = e.clone();
             }
+            self.selected = Some(e);
+            return;
+        }
+        self.park_active();
+        self.tabs.push(Tab {
+            entry: e,
+            editor: None,
+            image: ImageState::default(),
+            video: VideoState::default(),
+            dup: DupState::default(),
+        });
+        self.active = self.tabs.len() - 1;
+        self.load_active();
+    }
+
+    /// 把当前页签的实时状态存回 `tabs[active]`。
+    /// 视频先暂停——页签切走了还在响，等于没切。
+    fn park_active(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let i = self.active.min(self.tabs.len() - 1);
+        // 实时状态里的播放器才是正在出声的那个，先按暂停
+        if let Some(p) = &self.video.player {
+            p.set_paused(true);
+        }
+        let Some(e) = self.selected.take() else { return };
+        if self.tabs[i].entry.id != e.id {
+            // 不该发生；真发生了就以实时状态为准，别把页签写乱
+            self.selected = Some(e);
+            return;
+        }
+        let t = &mut self.tabs[i];
+        t.entry = e;
+        t.editor = self.editor.take();
+        t.image = std::mem::take(&mut self.image);
+        t.video = std::mem::take(&mut self.video);
+        t.dup = std::mem::take(&mut self.dup);
+        // 正在算的查重属于旧页签，结论回来也没人要了
+        self.dup_rx = None;
+    }
+
+    /// 把 `tabs[active]` 的状态装回实时字段。
+    fn load_active(&mut self) {
+        self.editor = None;
+        self.image = ImageState::default();
+        self.video = VideoState::default();
+        self.dup = DupState::default();
+        self.dup_rx = None;
+        let Some(t) = self.tabs.get_mut(self.active) else {
+            self.selected = None;
+            return;
+        };
+        self.selected = Some(t.entry.clone());
+        self.editor = t.editor.take();
+        self.image = std::mem::take(&mut t.image);
+        self.video = std::mem::take(&mut t.video);
+        self.dup = std::mem::take(&mut t.dup);
+    }
+
+    /// 切到第 `idx` 个页签。
+    pub fn activate_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() || (idx == self.active && self.selected.is_some()) {
+            return;
+        }
+        if self.privacy_on {
+            self.exit_privacy_mode();
+        }
+        if self.editor.as_ref().is_some_and(|ed| ed.dirty) {
+            self.flush_editor();
+        }
+        self.renaming = false;
+        self.park_active();
+        self.active = idx;
+        self.load_active();
+    }
+
+    /// 关掉第 `idx` 个页签。关当前页签时视频随 Player 一起 drop，声音立刻停。
+    pub fn close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let closing_active = idx == self.active;
+        self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            self.active = 0;
+            self.selected = None;
             self.editor = None;
+            self.image = ImageState::default();
+            self.video = VideoState::default();
+            self.dup = DupState::default();
+            self.dup_rx = None;
+            self.renaming = false;
+            return;
         }
-        self.selected = e;
-        self.image.for_id.clear();
-        self.image.rx = None;
-        self.image.frames.clear();
+        if closing_active {
+            self.active = idx.min(self.tabs.len() - 1);
+            self.load_active();
+        } else if idx < self.active {
+            self.active -= 1;
+        }
+    }
+
+    /// 条目被删掉/清空时，把对应的页签一起关掉。
+    pub fn close_tab_by_id(&mut self, id: &str) {
+        if let Some(i) = self.tabs.iter().position(|t| t.entry.id == id) {
+            self.close_tab(i);
+        }
+    }
+
+    /// 改名/改大小之后把条目信息回写页签，页签栏才不会一直显示旧名字。
+    fn sync_active_entry(&mut self) {
+        let Some(e) = &self.selected else { return };
+        let Some(t) = self.tabs.get_mut(self.active) else { return };
+        if t.entry.id == e.id
+            && (t.entry.name != e.name
+                || t.entry.size != e.size
+                || t.entry.modified_at != e.modified_at
+                || t.entry.version_count != e.version_count
+                || t.entry.deleted_at != e.deleted_at)
+        {
+            t.entry = e.clone();
+        }
     }
 
     /// 打开目录（面包屑下钻）。
@@ -362,6 +525,8 @@ impl App {
             Ok(v) => {
                 ed.dirty = false;
                 ed.phase = "已加密写入";
+                // 内容变了，查重结论作废
+                self.invalidate_duplicates();
                 if let Some(s) = self.selected.as_mut() {
                     if s.id == v.id {
                         *s = v;
@@ -388,15 +553,24 @@ impl App {
         if let Some(ed) = self.editor.as_mut() {
             ed.dirty = false; // 锁了就保存不了了，别让它反复尝试
         }
+        // 必须走 set_privacy_mode 而不是直接置 false：
+        // 直接置位会把「输入法已解绑 / 已切英文」的状态留在窗口上，
+        // 解锁后所有输入框都打不进中文（英文却正常）。
+        self.exit_privacy_mode();
         self.editor = None;
         self.selected = None;
+        // 锁库要把页签全清掉：视频、解码线程、解密出来的画面都不该留着
+        self.tabs.clear();
+        self.active = 0;
         self.entries.clear();
         self.panel = None;
         self.confirm = None;
-        self.privacy_on = false;
+        self.invalidate_duplicates();
         self.image.texture = None;
         self.image.rx = None;
         self.image.frames.clear();
+        // 视频也要停：锁了库还听见声音，等于把「刚才在看什么」漏出去
+        self.video = VideoState::default();
         self.need_status = true;
         // 回到锁屏：重新把焦点交给密码框
         self.lock_focus_pending = true;
@@ -420,6 +594,8 @@ impl App {
                 }
                 self.need_list = true;
                 self.need_status = true;
+                // 多了一批文件，查重结论作废
+                self.invalidate_duplicates();
             }
             Err(e) => self.notify(format!("导入失败：{e}")),
         }
@@ -427,10 +603,92 @@ impl App {
 
     /// 进入改名：把原名填进输入框，并标记下一帧抢一次焦点。
     /// 焦点只能抢一次（见 `rename_focus_pending` 的注释）。
+    ///
+    /// 改名框是**系统输入法**的输入框（不是隐私输入的自绘组件），所以进门
+    /// 第一件事是把输入法还回来：隐私输入如果还在开着（改文本文件时点重命名
+    /// 就会这样），每帧的 `keep_ime_off` 会把输入法摁成英文——表现就是
+    /// 「英文能打、拼音打不进去」。历史遗留的解绑状态也一并在这里重建。
     pub fn begin_rename(&mut self, name: &str) {
+        if self.privacy_on {
+            self.exit_privacy_mode();
+        }
+        if let Some(h) = self.hwnd {
+            service::ensure_ime_available(h);
+        }
+        // 显式打开 IME：egui 只在焦点变化时才发这条命令，
+        // 而焦点变化与「输入法被外部改掉」并不同步，这里补一次才稳。
+        self.ctx
+            .send_viewport_cmd(egui::ViewportCommand::IMEAllowed(true));
         self.renaming = true;
         self.rename_draft = name.to_string();
         self.rename_focus_pending = true;
+    }
+
+    /// 查重：选中文件后在后台算「这份内容在库里还有没有别的副本」。
+    ///
+    /// 放后台是因为要比对明文（密文按条目派生密钥，密文之间毫无相似之处）。
+    /// 代价已经封死：单份超过 16 MiB 直接跳过，同大小候选最多比 6 个，
+    /// 所以一次查重最坏也就是几十毫秒级别的读盘量，视频更是一个字节都不读。
+    /// 一次只跑一个任务：切来切去时后来的结论没意义。
+    pub fn ensure_dup_check(&mut self, id: &str) {
+        if self.dup.for_id == id || self.dup_rx.is_some() {
+            return;
+        }
+        self.dup = DupState {
+            for_id: id.to_string(),
+            pending: true,
+            hits: Vec::new(),
+            error: None,
+            skipped_size: None,
+            truncated: 0,
+        };
+        let state = Arc::clone(&self.state);
+        let ctx = self.ctx.clone();
+        let want = id.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.dup_rx = Some(rx);
+        std::thread::spawn(move || {
+            let res = service::find_duplicates(&state, &want).map_err(|e| e.to_string());
+            let _ = tx.send((want, res));
+            ctx.request_repaint();
+        });
+    }
+
+    /// 后台查重结果回填（每帧轮询）。
+    fn poll_dup(&mut self) {
+        let Some(rx) = &self.dup_rx else { return };
+        match rx.try_recv() {
+            Ok((id, res)) => {
+                self.dup.for_id = id;
+                self.dup.pending = false;
+                match res {
+                    Ok(rep) => {
+                        self.dup.hits = rep.hits;
+                        self.dup.skipped_size = rep.skipped_size;
+                        self.dup.truncated = rep.truncated;
+                        self.dup.error = None;
+                    }
+                    Err(e) => {
+                        self.dup.hits.clear();
+                        self.dup.error = Some(e);
+                    }
+                }
+                self.dup_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.dup_rx = None;
+                self.dup.pending = false;
+            }
+        }
+    }
+
+    /// 内容或候选集变了，旧结论作废（下次渲染选中项时重算）。
+    ///
+    /// 触发点：保存、导入、删除/恢复、移动、回滚版本。**换选中不触发**——
+    /// 结论按条目 id 存着，切回来就不用重算。
+    pub fn invalidate_duplicates(&mut self) {
+        self.dup = DupState::default();
     }
 
     pub fn new_folder(&mut self) {
@@ -453,6 +711,8 @@ impl App {
                     self.selected = Some(v);
                 }
                 self.need_list = true;
+                // 位置变了，「在哪里」的提示要重算
+                self.invalidate_duplicates();
             }
             Err(e) => self.notify(format!("移动失败：{e}")),
         }
@@ -462,12 +722,10 @@ impl App {
         match service::delete_entry(&self.state, id) {
             Ok(()) => {
                 self.notify("已移入回收站");
-                if self.selected.as_ref().is_some_and(|s| s.id == id) {
-                    self.editor = None;
-                    self.selected = None;
-                }
+                self.close_tab_by_id(id);
                 self.need_list = true;
                 self.need_status = true;
+                self.invalidate_duplicates();
             }
             Err(e) => self.notify(format!("删除失败：{e}")),
         }
@@ -477,12 +735,11 @@ impl App {
         match service::purge_entry(&self.state, id) {
             Ok(()) => {
                 self.notify("已彻底删除");
-                if self.selected.as_ref().is_some_and(|s| s.id == id) {
-                    self.editor = None;
-                    self.selected = None;
-                }
+                self.close_tab_by_id(id);
                 self.need_list = true;
                 self.need_status = true;
+                self.invalidate_duplicates();
+                self.invalidate_duplicates();
             }
             Err(e) => self.notify(format!("删除失败：{e}")),
         }
@@ -494,6 +751,7 @@ impl App {
                 self.notify("已恢复");
                 self.need_list = true;
                 self.need_status = true;
+                self.invalidate_duplicates();
             }
             Err(e) => self.notify(format!("恢复失败：{e}")),
         }
@@ -527,13 +785,8 @@ impl App {
             Nav::Trash => service::list_trash(&self.state).unwrap_or_default(),
             other => service::list_by_kind(&self.state, other.kind_param()).unwrap_or_default(),
         };
-        // 保持选中（如果它还在列表里）
-        if let Some(sel) = &self.selected {
-            if !self.entries.iter().any(|e| e.id == sel.id) {
-                self.editor = None;
-                self.selected = None;
-            }
-        }
+        // 注意：**不要**在这里因为「选中项不在当前列表」就把 selected 清掉。
+        // 页签是跨目录的，浏览到别的文件夹时正在看的东西要留着。
     }
 
     /// 每帧前置处理。
@@ -563,6 +816,16 @@ impl App {
             }
         }
         self.was_window_focused = focused_now;
+
+        // 2.6 隐私状态自愈：隐私输入只存在于文本编辑器里（`privacy::show`
+        //     在没有编辑器时直接不画）。一旦编辑器被清掉（删文件、条目消失、
+        //     切到文件夹），privacy_on 若继续挂着，下面每帧的 keep_ime_off 会把
+        //     系统输入法死死摁在英文——全应用的输入框（改名、筛选、搜索）都变成
+        //     「英文能打、拼音打不进去」。所以没编辑器就立刻退出并还原输入法。
+        if self.privacy_on && self.editor.is_none() {
+            self.exit_privacy_mode();
+        }
+
         if self.privacy_on {
             if let Some(h) = self.hwnd {
                 crate::ime::keep_ime_off(h);
@@ -597,6 +860,9 @@ impl App {
                 self.image.rx = None;
             }
         }
+
+        // 4.5 查重结论
+        self.poll_dup();
 
         // 5. 建索引后台线程结果
         let building = self.state.search_building.load(std::sync::atomic::Ordering::SeqCst);
