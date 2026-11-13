@@ -411,6 +411,81 @@ pub fn rename_entry(state: &AppState, id: &str, name: &str) -> Result<EntryView>
     })
 }
 
+/// 一次批量改名的结果。
+#[derive(Serialize, Clone)]
+pub struct BatchRenameReport {
+    pub renamed: usize,
+    /// 新旧名字相同、无事可做的项
+    pub skipped: usize,
+    /// 改名后的条目视图（按传入顺序），UI 拿来同步页签/选中项的名字
+    pub entries: Vec<EntryView>,
+}
+
+/// 批量改名：一批条目在**一次写盘**里改完，要么全成、要么不动。
+///
+/// 冲突按「同一文件夹内不能重名」校验：本批不改名的条目名字照常占位；
+/// 要改名的条目**统一先让出旧名**，再按传入顺序占用新名——这样 A↔B 互换也能通过。
+/// 任何一项不合法（重名 / 空名 / 带路径分隔符 / 在回收站里）整批拒绝。
+/// 注意 `state.write` 没有回滚，所以这里必须**两遍式**：先只读校验 + 在占用表里
+/// 模拟，全部通过才动内存索引和磁盘。
+pub fn batch_rename(state: &AppState, updates: &[(String, String)]) -> Result<BatchRenameReport> {
+    state.write(|v| {
+        use std::collections::HashSet;
+        // 名字占用表：(父目录, 名字)。所有未删除条目的旧名先全部占位。
+        let mut taken: HashSet<(String, String)> = HashSet::new();
+        for e in v.index.entries.values() {
+            if e.deleted_at.is_none() {
+                taken.insert((e.parent.clone(), e.name.clone()));
+            }
+        }
+        let mut skipped = 0usize;
+        let mut planned: Vec<(String, String, String, String)> = Vec::new(); // (id, parent, 旧名, 新名)
+        for (id, name) in updates {
+            let e = v.index.entries.get(id).ok_or(Error::NotFound)?;
+            if e.deleted_at.is_some() {
+                return Err(Error::Msg(format!("「{}」在回收站里，不能改名", e.name)));
+            }
+            let (parent, old) = (e.parent.clone(), e.name.clone());
+            let new = name.trim();
+            if new.is_empty() {
+                return Err(Error::Msg("新名称不能为空，整批未执行".into()));
+            }
+            if new.contains('\\') || new.contains('/') {
+                return Err(Error::Msg(format!("新名称不能包含 \\ 或 /：「{new}」，整批未执行")));
+            }
+            if new == old {
+                skipped += 1;
+                continue; // 名字不变：旧名继续占位
+            }
+            planned.push((id.clone(), parent, old, new.to_string()));
+        }
+        // 统一让出整批的旧名，再按顺序占新名（互换因此合法）
+        for (_, parent, old, _) in &planned {
+            taken.remove(&(parent.clone(), old.clone()));
+        }
+        for (_, parent, _, new) in &planned {
+            let key = (parent.clone(), new.clone());
+            if taken.contains(&key) {
+                return Err(Error::Msg(format!("「{new}」在目标文件夹里已存在，整批未执行")));
+            }
+            taken.insert(key);
+        }
+        // 第二遍：全部合法，一次性落库
+        let mut entries = Vec::with_capacity(planned.len());
+        for (id, _, _, new) in planned {
+            let e = v.index.entries.get_mut(&id).ok_or(Error::NotFound)?;
+            e.name = new;
+            e.modified_at = now_ts();
+            let out = e.clone();
+            entries.push(to_view(&out));
+        }
+        if !entries.is_empty() {
+            v.save_index()?;
+        }
+        Ok(BatchRenameReport { renamed: entries.len(), skipped, entries })
+    })
+}
+
 // ─────────────────────────── 内容读写 ───────────────────────────
 
 pub fn read_text(state: &AppState, id: &str) -> Result<TextPayload> {

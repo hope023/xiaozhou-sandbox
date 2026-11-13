@@ -303,6 +303,70 @@ mod tests {
         assert!(service::list_dir(&state, &folder.id).unwrap().is_empty());
     }
 
+    /// 批量改名：一批一次写盘；冲突整批拒绝；无变化的条目跳过；互换合法。
+    #[test]
+    fn batch_rename_atomic_and_conflict_checked() {
+        let dir = tmp("batch-rename");
+        vault::create(&dir, "pw12345678", None).unwrap();
+        let dek = vault::unlock(&dir, "pw12345678").unwrap();
+        let mut v = store::Vault::open(dir.clone(), dek).unwrap();
+
+        let mut ids = Vec::new();
+        for name in ["a.txt", "b.txt", "c.md"] {
+            let p = dir.join(name);
+            std::fs::write(&p, format!("content of {name}")).unwrap();
+            ids.push(v.import_file("root", name, &p).unwrap().id);
+        }
+        v.save_index().unwrap();
+
+        let state = std::sync::Arc::new(state::AppState::default());
+        service::open_vault_at(&state, &dir.display().to_string()).unwrap();
+        service::unlock(&state, "pw12345678").unwrap();
+
+        // 正常批量：两个改名 + 一个无变化（跳过）
+        let updates = vec![
+            (ids[0].clone(), "照片-01.txt".to_string()),
+            (ids[1].clone(), "照片-02.txt".to_string()),
+            (ids[2].clone(), "c.md".to_string()),
+        ];
+        let rep = service::batch_rename(&state, &updates).unwrap();
+        assert_eq!(rep.renamed, 2);
+        assert_eq!(rep.skipped, 1);
+        let names: Vec<String> =
+            service::list_dir(&state, "root").unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.contains(&"照片-01.txt".to_string()));
+        assert!(names.contains(&"照片-02.txt".to_string()));
+        assert!(rep.entries.iter().all(|e| e.name != "a.txt" && e.name != "b.txt"));
+
+        // 冲突：目标名已被同文件夹里不变的条目占用 → 整批拒绝，一个都不动
+        let bad = vec![
+            (ids[0].clone(), "查重会失败.txt".to_string()),
+            (ids[1].clone(), "c.md".to_string()), // c.md 被跳过的第三项占着
+        ];
+        assert!(service::batch_rename(&state, &bad).is_err());
+        let names: Vec<String> =
+            service::list_dir(&state, "root").unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.contains(&"照片-01.txt".to_string()), "冲突时整批不应生效");
+        assert!(!names.contains(&"查重会失败.txt".to_string()), "排在冲突项之前的改动也不能生效");
+
+        // 非法名字：空名 / 带路径分隔符
+        assert!(service::batch_rename(&state, &[(ids[0].clone(), "   ".into())]).is_err());
+        assert!(service::batch_rename(&state, &[(ids[0].clone(), "a/b.txt".into())]).is_err());
+        assert!(service::batch_rename(&state, &[(ids[0].clone(), "a\\b.txt".into())]).is_err());
+
+        // 互换：改名的条目先让出旧名再占新名，A↔B 互换应当成功
+        let swap = vec![
+            (ids[0].clone(), "照片-02.txt".to_string()),
+            (ids[1].clone(), "照片-01.txt".to_string()),
+        ];
+        let rep = service::batch_rename(&state, &swap).unwrap();
+        assert_eq!(rep.renamed, 2);
+        let names: Vec<String> =
+            service::list_dir(&state, "root").unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.contains(&"照片-01.txt".to_string()) && names.contains(&"照片-02.txt".to_string()));
+        assert_eq!(names.iter().filter(|n| n.as_str() == "照片-01.txt").count(), 1, "不能出现重名");
+    }
+
     /// 已有库补第二口令：第二口令进的是独立空库，主库内容不受影响。
     #[test]
     fn add_second_password_to_existing_vault() {

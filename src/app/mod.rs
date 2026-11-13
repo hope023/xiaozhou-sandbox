@@ -4,6 +4,7 @@
 //! → 编辑器 800ms 自动保存 → 处理拖拽导入 / Ctrl+K → 刷新状态与列表 → 渲染。
 
 mod about;
+mod batch_rename;
 mod file_list;
 mod ime_engine;
 mod inspector;
@@ -199,6 +200,8 @@ pub struct App {
 
     pub toast: Option<Toast>,
     pub confirm: Option<Confirm>,
+    /// 批量重命名弹窗（当前文件夹）。`None` = 关闭。
+    pub batch: Option<batch_rename::BatchRenameState>,
 
     pub panel: Option<Panel>,
     pub settings_draft: Option<crate::store::Settings>,
@@ -286,6 +289,7 @@ impl App {
             selected: None,
             toast: None,
             confirm: None,
+            batch: None,
             panel: None,
             settings_draft: None,
             settings_capture: false,
@@ -608,6 +612,7 @@ impl App {
         self.entries.clear();
         self.panel = None;
         self.confirm = None;
+        self.batch = None;
         self.invalidate_duplicates();
         self.image.texture = None;
         self.image.rx = None;
@@ -1049,6 +1054,8 @@ impl App {
                 ConfirmAction::PurgeTrash => self.purge_trash(),
             }
         }
+
+        self.show_batch_rename(ctx);
     }
 
     /// 进入/退出隐私输入模式（系统 IME 解绑联动）。

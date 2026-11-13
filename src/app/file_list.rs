@@ -86,7 +86,7 @@ impl App {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
                             .hint_text("筛选当前列表（Ctrl+K 搜全文）")
-                            .desired_width((ui.available_width() - 122.0).max(120.0)),
+                            .desired_width((ui.available_width() - 154.0).max(120.0)),
                     );
                     if widgets::icon_button(ui, Icon::Search, "全文搜索（Ctrl+K）").clicked() {
                         self.panel = Some(Panel::Search);
@@ -95,6 +95,9 @@ impl App {
                     }
                     if self.nav == Nav::Dir && widgets::icon_button(ui, Icon::FolderPlus, "新建文件夹").clicked() {
                         self.new_folder();
+                    }
+                    if self.nav == Nav::Dir && widgets::icon_button(ui, Icon::Edit, "批量重命名当前文件夹").clicked() {
+                        self.open_batch_rename();
                     }
                     if self.nav == Nav::Dir && widgets::icon_button(ui, Icon::Upload, "导入文件（也可拖进来）").clicked() {
                         if let Some(paths) = rfd::FileDialog::new().pick_files() {
