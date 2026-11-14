@@ -11,6 +11,7 @@ mod inspector;
 mod lock_screen;
 mod panels;
 mod sidebar;
+mod sort;
 mod statusbar;
 mod text_editor;
 mod theme;
@@ -196,6 +197,8 @@ pub struct App {
     pub entries: Vec<EntryView>,
     pub need_list: bool,
     pub filter: String,
+    /// 文件列表的排序方式（名称自然排序 / 时间 / 大小 / 类型）
+    pub sort: sort::SortSpec,
     pub selected: Option<EntryView>,
 
     pub toast: Option<Toast>,
@@ -286,6 +289,7 @@ impl App {
             entries: Vec::new(),
             need_list: true,
             filter: String::new(),
+            sort: sort::SortSpec::default(),
             selected: None,
             toast: None,
             confirm: None,
@@ -859,6 +863,10 @@ impl App {
             Nav::Trash => service::list_trash(&self.state).unwrap_or_default(),
             other => service::list_by_kind(&self.state, other.kind_param()).unwrap_or_default(),
         };
+        // 回收站固定按删除时间排列，其余列表跟随用户选择的排序方式
+        if self.nav != Nav::Trash {
+            sort::sort_entries(&mut self.entries, self.sort);
+        }
         // 注意：**不要**在这里因为「选中项不在当前列表」就把 selected 清掉。
         // 页签是跨目录的，浏览到别的文件夹时正在看的东西要留着。
     }

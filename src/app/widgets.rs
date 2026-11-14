@@ -287,6 +287,7 @@ pub enum Icon {
     Unlock,
     Settings,
     Search,
+    Sort,
     Plus,
     Upload,
     Download,
@@ -416,6 +417,15 @@ pub fn icon(p: &egui::Painter, center: egui::Pos2, kind: Icon, color: Color32, s
         Icon::Search => {
             p.circle_stroke(pt(10.5, 10.5), 6.2, st);
             line((15.2, 15.2), (20.0, 20.0));
+        }
+        Icon::Sort => {
+            // 左侧三条渐短的横线 + 右侧向下箭头
+            line((4.0, 7.0), (13.0, 7.0));
+            line((4.0, 12.0), (10.0, 12.0));
+            line((4.0, 17.0), (7.0, 17.0));
+            line((17.0, 5.0), (17.0, 18.5));
+            line((14.0, 15.5), (17.0, 18.5));
+            line((20.0, 15.5), (17.0, 18.5));
         }
         Icon::Plus => {
             line((12.0, 5.0), (12.0, 19.0));

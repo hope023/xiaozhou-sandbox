@@ -3,7 +3,7 @@
 use eframe::egui::{self, Align2, FontId, CornerRadius, Stroke, Vec2};
 
 use super::theme;
-use super::{App, Nav, Panel};
+use super::{sort, App, Nav, Panel};
 use super::widgets::{self, Icon};
 
 const ROW_H: f32 = 46.0;
@@ -83,10 +83,18 @@ impl App {
 
                 // ── 工具行：筛选框 + 图标按钮 ──
                 ui.horizontal(|ui| {
+                    // 预留图标按钮的宽度，筛选框不被挤没
+                    let tools = match self.nav {
+                        Nav::Dir => 5.0,
+                        Nav::Trash => 1.0,
+                        _ => 2.0,
+                    };
+                    let filter_w =
+                        (ui.available_width() - (tools * 36.0 + 10.0)).max(120.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
                             .hint_text("筛选当前列表（Ctrl+K 搜全文）")
-                            .desired_width((ui.available_width() - 154.0).max(120.0)),
+                            .desired_width(filter_w),
                     );
                     if widgets::icon_button(ui, Icon::Search, "全文搜索（Ctrl+K）").clicked() {
                         self.panel = Some(Panel::Search);
@@ -104,6 +112,25 @@ impl App {
                             let v: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
                             self.import_from(v);
                         }
+                    }
+                    // 排序方式：回收站固定按删除时间排，不提供切换
+                    if self.nav != Nav::Trash {
+                        let tip = format!("排序方式（当前：{}）", self.sort.label());
+                        let btn = widgets::icon_button(ui, Icon::Sort, &tip);
+                        egui::Popup::menu(&btn).show(|ui| {
+                            ui.set_min_width(150.0);
+                            for k in sort::SortKey::ALL {
+                                if ui.selectable_label(self.sort.key == k, k.label()).clicked() {
+                                    self.sort.set_key(k);
+                                    sort::sort_entries(&mut self.entries, self.sort);
+                                }
+                            }
+                            ui.separator();
+                            let desc = ui.checkbox(&mut self.sort.desc, "倒序");
+                            if desc.on_hover_text("反向排列（名称 Z→A、时间新→旧）").changed() {
+                                sort::sort_entries(&mut self.entries, self.sort);
+                            }
+                        });
                     }
                 });
 
